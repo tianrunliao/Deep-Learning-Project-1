@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>神经网络训练配置</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            padding: 20px;
+            background-color: #f8f9fa;
+        }
+        .tab-content {
+            padding: 20px;
+            background-color: #fff;
+            border: 1px solid #dee2e6;
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+        }
+        .nav-tabs .nav-link.active {
+            font-weight: bold;
+        }
+        .progress {
+            height: 25px;
+            margin: 20px 0;
+        }
+        #run-btn {
+            margin: 20px 0;
+            width: 100%;
+            padding: 10px;
+            font-size: 1.1em;
+        }
+        #results-section {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            min-height: 100px;
+        }
+        .option-group {
+            margin-bottom: 15px;
+            padding: 10px;
+            border-radius: 5px;
+            background-color: #f8f9fa;
+        }
+        /* 模型结构图样式 */
+        .model-structure {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+        }
+        .layers-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 20px 0;
+            min-height: 150px;
+        }
+        .cnn-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 20px 0;
+        }
+        .layer {
+            background-color: #e9ecef;
+            border-radius: 5px;
+            padding: 10px;
+            text-align: center;
+            margin: 0 10px;
+            height: 80px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            position: relative;
+        }
+        .cnn-layer {
+            background-color: #e9ecef;
+            border-radius: 5px;
+            padding: 10px;
+            text-align: center;
+            margin: 5px 0;
+            width: 200px;
+            height: 50px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .connection {
+            border-top: 2px solid #6c757d;
+            width: 50px;
+            position: absolute;
+            right: -50px;
+            top: 40px;
+        }
+        .activation {
+            color: #0d6efd;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin: 5px 0;
+        }
+        .input-layer { background-color: #d1e7dd; }
+        .conv-layer { background-color: #cfe2ff; }
+        .pool-layer { background-color: #f8d7da; }
+        .fc-layer { background-color: #fff3cd; }
+        .output-layer { background-color: #d1e7dd; }
+        
+        .config-summary {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+        }
+        .config-summary ul {
+            list-style-type: none;
+            padding-left: 10px;
+        }
+        .config-summary li {
+            margin-bottom: 5px;
+        }
+        .manual-only {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="text-center mb-4">神经网络训练配置</h1>
+        
+        <!-- 选项卡导航 -->
+        <ul class="nav nav-tabs" id="configTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="basic-tab" data-bs-toggle="tab" data-bs-target="#basic" type="button" role="tab" aria-controls="basic" aria-selected="true">基本设置</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="model-tab" data-bs-toggle="tab" data-bs-target="#model" type="button" role="tab" aria-controls="model" aria-selected="false">模型结构</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="training-tab" data-bs-toggle="tab" data-bs-target="#training" type="button" role="tab" aria-controls="training" aria-selected="false">训练参数</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="regularization-tab" data-bs-toggle="tab" data-bs-target="#regularization" type="button" role="tab" aria-controls="regularization" aria-selected="false">正则化设置</button>
+            </li>
+        </ul>
+        
+        <!-- 选项卡内容 -->
+        <div class="tab-content" id="configTabsContent">
+            <!-- 基本设置选项卡 -->
+            <div class="tab-pane fade show active" id="basic" role="tabpanel" aria-labelledby="basic-tab">
+                <h4>选择基本设置</h4>
+                
+                <div class="option-group">
+                    <h5>运行模式</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="run_mode" id="run-recommended" value="recommended" checked>
+                        <label class="form-check-label" for="run-recommended">使用推荐配置运行（固定中型结构，简单配置）</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="run_mode" id="run-bayesian" value="bayesian">
+                        <label class="form-check-label" for="run-bayesian">使用贝叶斯优化（自动搜索最佳结构和超参数）</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="run_mode" id="run-manual" value="manual">
+                        <label class="form-check-label" for="run-manual">手动配置（完全自定义所有超参数）</label>
+                    </div>
+                </div>
+                
+                <div class="option-group">
+                    <h5>模型类型</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="model_type" id="model-mlp" value="mlp" checked>
+                        <label class="form-check-label" for="model-mlp">多层感知机 (MLP)</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="model_type" id="model-cnn" value="cnn">
+                        <label class="form-check-label" for="model-cnn">卷积神经网络 (CNN)</label>
+                    </div>
+                </div>
+                
+                <div class="option-group">
+                    <h5>数据增强</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="use-augmented" name="use_augmented_data" value="true">
+                        <label class="form-check-label" for="use-augmented">使用增强训练数据（注意：可能需要调整其他参数获得最佳效果）</label>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 模型结构选项卡 -->
+            <div class="tab-pane fade" id="model" role="tabpanel" aria-labelledby="model-tab">
+                <h4>选择模型结构</h4>
+                
+                <div class="alert alert-info">
+                    <small>结构大小将由贝叶斯优化自动确定，无需手动选择。优化将在小型、中型、大型结构中寻找最佳配置。</small>
+                </div>
+                
+                <div class="alert alert-info bayesian-info d-none">
+                    <small>贝叶斯优化模式下，系统将自动搜索最佳的结构配置和超参数组合，并比较不同正则化策略的效果。</small>
+                </div>
+                
+                <div class="option-group">
+                    <h5>激活函数</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="activation_fn" id="activation-relu" value="relu" checked>
+                        <label class="form-check-label" for="activation-relu">ReLU</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="activation_fn" id="activation-sigmoid" value="sigmoid">
+                        <label class="form-check-label" for="activation-sigmoid">Sigmoid</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="activation_fn" id="activation-tanh" value="tanh">
+                        <label class="form-check-label" for="activation-tanh">Tanh</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="activation_fn" id="activation-leaky" value="leaky_relu">
+                        <label class="form-check-label" for="activation-leaky">Leaky ReLU</label>
+                    </div>
+                </div>
+                
+                <div class="option-group cnn-options">
+                    <h5>池化类型 (仅CNN)</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="pool_type" id="pool-max" value="max" checked>
+                        <label class="form-check-label" for="pool-max">Max Pooling</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="pool_type" id="pool-avg" value="avg">
+                        <label class="form-check-label" for="pool-avg">Average Pooling</label>
+                    </div>
+                </div>
+                
+                <div id="manual-structure-options" class="option-group manual-only" style="display:none;">
+                    <h5>结构大小（仅手动模式）</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="manual_structure" id="structure-small" value="small">
+                        <label class="form-check-label" for="structure-small">小型</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="manual_structure" id="structure-medium" value="medium" checked>
+                        <label class="form-check-label" for="structure-medium">中型</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="manual_structure" id="structure-large" value="large">
+                        <label class="form-check-label" for="structure-large">大型</label>
+                    </div>
+                    <small class="form-text text-muted mlp-structure-info">
+                        小型: [128] | 中型: [256, 128] | 大型: [512, 256, 128]
+                    </small>
+                    <small class="form-text text-muted cnn-structure-info d-none">
+                        小型: [16, 32] | 中型: [32, 64] | 大型: [64, 128]
+                    </small>
+                </div>
+
+                <div id="manual-lr-options" class="option-group manual-only" style="display:none;">
+                    <h5>学习率（仅手动模式）</h5>
+                    <div class="form-group">
+                        <input type="range" class="form-range" id="lr-range" min="0.001" max="0.1" step="0.001" value="0.01">
+                        <div class="d-flex justify-content-between">
+                            <small>0.001</small>
+                            <small id="lr-value">0.01</small>
+                            <small>0.1</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="manual-epochs-options" class="option-group manual-only" style="display:none;">
+                    <h5>训练周期（仅手动模式）</h5>
+                    <div class="form-group">
+                        <input type="range" class="form-range" id="epochs-range" min="5" max="20" step="1" value="10">
+                        <div class="d-flex justify-content-between">
+                            <small>5</small>
+                            <small id="epochs-value">10</small>
+                            <small>20</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 训练参数选项卡 -->
+            <div class="tab-pane fade" id="training" role="tabpanel" aria-labelledby="training-tab">
+                <h4>选择训练参数</h4>
+                
+                <div class="option-group">
+                    <h5>损失函数</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="loss_type" id="loss-ce" value="cross_entropy" checked>
+                        <label class="form-check-label" for="loss-ce">交叉熵损失 (CrossEntropyLoss)</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="loss_type" id="loss-mse" value="mse">
+                        <label class="form-check-label" for="loss-mse">均方误差损失 (MSELoss)</label>
+                    </div>
+                </div>
+                
+                <div class="option-group">
+                    <h5>优化器</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="optimizer_type" id="optimizer-sgd" value="sgd" checked>
+                        <label class="form-check-label" for="optimizer-sgd">SGD</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="optimizer_type" id="optimizer-adam" value="adam">
+                        <label class="form-check-label" for="optimizer-adam">Adam</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="optimizer_type" id="optimizer-adamw" value="adamw">
+                        <label class="form-check-label" for="optimizer-adamw">AdamW</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="radio" name="optimizer_type" id="optimizer-rmsprop" value="rmsprop">
+                        <label class="form-check-label" for="optimizer-rmsprop">RMSprop</label>
+                    </div>
+                </div>
+
+                <div id="sgd-options" class="option-group" style="display: none;">
+                    <h5>SGD专用选项</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="use-momentum" name="use_momentum" checked>
+                        <label class="form-check-label" for="use-momentum">使用动量(β=0.9)</label>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 正则化设置选项卡 -->
+            <div class="tab-pane fade" id="regularization" role="tabpanel" aria-labelledby="regularization-tab">
+                <h4>选择正则化设置</h4>
+                
+                <div class="option-group">
+                    <h5>选择正则化方法（可多选）</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="use-l1" name="regularization_methods" value="l1">
+                        <label class="form-check-label" for="use-l1">L1 正则化</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="use-l2" name="regularization_methods" value="l2">
+                        <label class="form-check-label" for="use-l2">L2 正则化</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="use-dropout" name="regularization_methods" value="dropout" checked>
+                        <label class="form-check-label" for="use-dropout">Dropout</label>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="use-early-stopping" name="regularization_methods" value="early_stopping" checked>
+                        <label class="form-check-label" for="use-early-stopping">早停</label>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 运行按钮 -->
+        <button type="button" id="run-btn" class="btn btn-primary">运行训练</button>
+        
+        <!-- 进度和结果区域 -->
+        <div id="results-section">
+            <div id="training-progress" class="d-none">
+                <h5>训练进行中...</h5>
+                <div class="progress">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
+                </div>
+                <p id="progress-text">初始化中...</p>
+            </div>
+            <div id="results-content">
+                <p class="text-center text-muted">点击"运行训练"按钮开始训练过程</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // 初始化UI
+            updateModelTypeUI();
+            updateRunModeUI();
+            
+            // 绑定事件监听器
+            document.getElementById('model-mlp').addEventListener('change', updateModelTypeUI);
+            document.getElementById('model-cnn').addEventListener('change', updateModelTypeUI);
+            document.getElementById('run-btn').addEventListener('click', function(event) {
+                console.log("Run button clicked"); // 添加调试日志
+                runTraining();
+            });
+            document.querySelectorAll('input[name="run_mode"]').forEach(radio => {
+                radio.addEventListener('change', updateRunModeUI);
+            });
+            
+            // 添加滑块值更新
+            document.getElementById('lr-range').addEventListener('input', function() {
+                document.getElementById('lr-value').textContent = this.value;
+            });
+            document.getElementById('epochs-range').addEventListener('input', function() {
+                document.getElementById('epochs-value').textContent = this.value;
+            });
+            
+            document.querySelectorAll('input[name="optimizer_type"]').forEach(radio => {
+                radio.addEventListener('change', updateOptimizerUI);
+            });
+            
+            // 更新模型类型相关UI
+            function updateModelTypeUI() {
+                const isCNN = document.getElementById('model-cnn').checked;
+                const cnnOptions = document.querySelectorAll('.cnn-options');
+                const mlpStructureInfo = document.querySelector('.mlp-structure-info');
+                const cnnStructureInfo = document.querySelector('.cnn-structure-info');
+                
+                cnnOptions.forEach(el => {
+                    if (isCNN) {
+                        el.classList.remove('d-none');
+                    } else {
+                        el.classList.add('d-none');
+                    }
+                });
+                
+                if (isCNN) {
+                    mlpStructureInfo.classList.add('d-none');
+                    cnnStructureInfo.classList.remove('d-none');
+                } else {
+                    mlpStructureInfo.classList.remove('d-none');
+                    cnnStructureInfo.classList.add('d-none');
+                }
+            }
+            
+            function updateRunModeUI() {
+                console.log("updateRunModeUI called"); // 调试信息
+                
+                const isManual = document.getElementById('run-manual').checked;
+                const isBayesian = document.getElementById('run-bayesian').checked;
+                const isRecommended = document.getElementById('run-recommended').checked;
+                
+                console.log("Mode selected:", {isManual, isBayesian, isRecommended}); // 调试信息
+                
+                // 处理手动模式选项
+                const manualOnlyOptions = document.querySelectorAll('.manual-only');
+                console.log("Manual only options count:", manualOnlyOptions.length); // 调试信息
+                
+                manualOnlyOptions.forEach(el => {
+                    if (isManual) {
+                        el.style.display = 'block'; // 使用style直接设置，避免CSS类冲突
+                    } else {
+                        el.style.display = 'none';
+                    }
+                });
+                
+                // 处理信息提示
+                const bayesianInfo = document.querySelector('.bayesian-info');
+                const standardInfo = document.querySelector('.alert-info:not(.bayesian-info)');
+                
+                if (bayesianInfo) {
+                    bayesianInfo.classList.toggle('d-none', !isBayesian);
+                }
+                
+                if (standardInfo) {
+                    standardInfo.classList.toggle('d-none', isBayesian || isManual);
+                }
+            }
+            
+            // 更新优化器UI函数
+            function updateOptimizerUI() {
+                const isSGD = document.getElementById('optimizer-sgd').checked;
+                const sgdOptions = document.getElementById('sgd-options');
+                
+                if (sgdOptions) {
+                    sgdOptions.style.display = isSGD ? 'block' : 'none';
+                }
+            }
+            
+            // 初始调用一次以设置正确的初始状态
+            updateOptimizerUI();
+            
+            // 收集表单数据
+            function collectConfig() {
+                const config = {
+                    run_mode: document.querySelector('input[name="run_mode"]:checked').value,
+                    model_type: document.querySelector('input[name="model_type"]:checked').value,
+                    use_augmented_data: document.getElementById('use-augmented').checked,
+                    activation_fn: document.querySelector('input[name="activation_fn"]:checked').value,
+                    loss_type: document.querySelector('input[name="loss_type"]:checked').value,
+                    optimizer_type: document.querySelector('input[name="optimizer_type"]:checked').value
+                };
+                
+                console.log("Data augmentation:", config.use_augmented_data);
+                
+                // 根据运行模式设置结构选项和其他参数
+                if (config.run_mode === "manual") {
+                    config.structure_option = document.querySelector('input[name="manual_structure"]:checked').value;
+                    config.learning_rate = parseFloat(document.getElementById('lr-range').value);
+                    config.num_epochs = parseInt(document.getElementById('epochs-range').value);
+                } else {
+                    config.structure_option = "medium";
+                }
+                
+                // 如果是CNN模型，添加池化类型
+                if (config.model_type === 'cnn') {
+                    config.pool_type = document.querySelector('input[name="pool_type"]:checked').value;
+                }
+                
+                // 收集正则化方法
+                const regMethodCheckboxes = document.querySelectorAll('input[name="regularization_methods"]:checked');
+                config.regularization_methods = Array.from(regMethodCheckboxes).map(cb => cb.value);
+                
+                // SGD动量参数
+                if (config.optimizer_type === 'sgd') {
+                    config.momentum = document.getElementById('use-momentum').checked ? 0.9 : 0.0;
+                }
+                
+                return config;
+            }
+            
+            // 运行训练
+            function runTraining() {
+                const config = collectConfig();
+                
+                // 添加激活函数和优化器的性能比较提示
+                const activationInfoMap = {
+                    "relu": "最常用于深度网络，性能良好",
+                    "sigmoid": "适用于二分类问题，深层网络中可能有梯度消失问题",
+                    "tanh": "比Sigmoid性能略好，范围为[-1,1]",
+                    "leaky_relu": "解决ReLU的死亡神经元问题，通常比ReLU有更好性能"
+                };
+                
+                const optimizerInfoMap = {
+                    "sgd": "标准方法，收敛较慢但稳定",
+                    "adam": "自适应学习率，通常收敛更快",
+                    "adamw": "Adam的改进版，更好地处理权重衰减",
+                    "rmsprop": "适用于RNN等非静态问题"
+                };
+                
+                const activationInfo = activationInfoMap[config.activation_fn] || "";
+                const optimizerInfo = optimizerInfoMap[config.optimizer_type] || "";
+                
+                let confirmMsg = `确认配置:\n
+                - 运行模式: ${config.run_mode === 'manual' ? '手动配置' : (config.run_mode === 'bayesian' ? '贝叶斯优化' : '推荐配置')}
+                - 模型类型: ${config.model_type === 'cnn' ? 'CNN' : 'MLP'}
+                - 激活函数: ${config.activation_fn}
+                - 优化器: ${config.optimizer_type}
+                - 数据增强: ${config.use_augmented_data ? '启用 (将显著提高准确率)' : '禁用'}
+                - 已选正则化方法: ${config.regularization_methods.length > 0 ? config.regularization_methods.join(', ') : '无'}`;
+                
+                if (!confirm(confirmMsg)) {
+                    return; // 用户取消操作
+                }
+                
+                console.log("Configuration:", config);
+                
+                const trainingProgress = document.getElementById('training-progress');
+                const progressBar = document.querySelector('.progress-bar');
+                const progressText = document.getElementById('progress-text');
+                const resultsContent = document.getElementById('results-content');
+                
+                // 显示进度条，隐藏结果
+                trainingProgress.classList.remove('d-none');
+                resultsContent.innerHTML = '';
+                progressBar.style.width = '0%';
+                progressText.textContent = '开始训练...';
+                
+                // 发送训练请求到后端
+                fetch('/api/train', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(config)
+                })
+                .then(response => {
+                    console.log("Server response status:", response.status);
+                    if (!response.ok) {
+                        throw new Error(`服务器响应错误: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    console.log("Server response data:", data);
+                    if (data.success) {
+                        // 开始轮询训练状态
+                        const jobId = data.job_id;
+                        pollTrainingStatus(jobId);
+                    } else {
+                        showError('无法启动训练：' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(error => {
+                    console.error("Request error:", error);
+                    showError('请求错误：' + error.message);
+                });
+            }
+            
+            // 轮询训练状态
+            function pollTrainingStatus(jobId) {
+                const progressBar = document.querySelector('.progress-bar');
+                const progressText = document.getElementById('progress-text');
+                
+                const statusInterval = setInterval(() => {
+                    fetch(`/api/train/status/${jobId}`)
+                        .then(response => response.json())
+                        .then(job => {
+                            // 更新进度条
+                            progressBar.style.width = `${job.progress}%`;
+                            progressText.textContent = `训练进度: ${job.progress}%`;
+                            
+                            // 如果训练完成，显示结果
+                            if (job.status === 'completed') {
+                                clearInterval(statusInterval);
+                                showResults(job);
+                            } else if (job.status === 'failed') {
+                                clearInterval(statusInterval);
+                                showError('训练失败：' + (job.error || '未知错误'));
+                            }
+                        })
+                        .catch(error => {
+                            clearInterval(statusInterval);
+                            showError('状态轮询错误：' + error.message);
+                        });
+                }, 2000); // 每2秒轮询一次，减少服务器压力
+            }
+            
+            // 显示结果
+            function showResults(job) {
+                const trainingProgress = document.getElementById('training-progress');
+                const resultsContent = document.getElementById('results-content');
+                
+                trainingProgress.classList.add('d-none');
+                
+                // 配置摘要
+                let configSummaryHTML = '';
+                if (job.results && job.results.config_summary) {
+                    configSummaryHTML = `
+                        <div class="config-summary">
+                            <h5>配置摘要:</h5>
+                            <ul>
+                                ${job.results.config_summary.map(item => `<li>${item}</li>`).join('')}
+                            </ul>
+                        </div>
+                    `;
+                }
+                
+                // 安全获取准确率
+                let accuracy = 0;
+                if (job.results) {
+                    if (job.config.run_mode === 'bayesian' && job.results.best_accuracy !== undefined) {
+                        accuracy = job.results.best_accuracy;
+                    } else if (job.results.accuracy !== undefined) {
+                        accuracy = job.results.accuracy;
+                    }
+                }
+                
+                // 显示所有正则化方法的比较结果
+                let regularizationRows = '';
+                
+                if (job.results && job.results.regularization_comparison) {
+                    job.results.regularization_comparison.forEach(reg => {
+                        regularizationRows += `
+                            <tr>
+                                <td>${getRegMethodName(reg.method)}</td>
+                                <td>${reg.accuracy.toFixed(2)}%</td>
+                            </tr>
+                        `;
+                    });
+                }
+                
+                resultsContent.innerHTML = `
+                    <div class="alert alert-success">
+                        <h4>${job.config.run_mode === 'bayesian' ? '贝叶斯优化' : (job.results ? job.results.mode || '训练' : '训练')}成功完成！</h4>
+                        ${configSummaryHTML}
+                        
+                        ${job.results && job.results.structure_html ? job.results.structure_html : ''}
+                        
+                        <p>最终测试准确率: ${accuracy.toFixed(2)}%</p>
+                        
+                        ${regularizationRows ? `
+                        <h5>正则化方法比较:</h5>
+                        <table class="table table-sm">
+                            <thead>
+                                <tr>
+                                    <th>正则化方法</th>
+                                    <th>测试准确率</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${regularizationRows}
+                            </tbody>
+                        </table>
+                        ` : ''}
+                        
+                        <div class="alert alert-info mt-2">
+                            <small>数据增强状态: ${job.config.use_augmented_data ? '已启用 (提升准确率约0.3-0.5%)' : '未启用'}</small>
+                        </div>
+                    </div>
+                `;
+            }
+            
+            // 显示错误
+            function showError(message) {
+                const trainingProgress = document.getElementById('training-progress');
+                const resultsContent = document.getElementById('results-content');
+                
+                trainingProgress.classList.add('d-none');
+                resultsContent.innerHTML = `
+                    <div class="alert alert-danger">
+                        <h4>出错了！</h4>
+                        <p>${message}</p>
+                    </div>
+                `;
+            }
+            
+            // 获取正则化方法的中文名称
+            function getRegMethodName(method) {
+                const names = {
+                    'none': '无正则化',
+                    'l1': 'L1 正则化',
+                    'l2': 'L2 正则化',
+                    'dropout': 'Dropout',
+                    'early_stopping': '早停'
+                };
+                return names[method] || method;
+            }
+
+            function setManualOptionsVisibility(visible) {
+                document.querySelectorAll('.manual-only').forEach(el => {
+                    el.style.display = visible ? 'block' : 'none';
+                });
+                
+                // 也可以直接操作特定元素
+                const manualStructure = document.getElementById('manual-structure-options');
+                const manualLR = document.getElementById('manual-lr-options');
+                const manualEpochs = document.getElementById('manual-epochs-options');
+                
+                if (manualStructure) manualStructure.style.display = visible ? 'block' : 'none';
+                if (manualLR) manualLR.style.display = visible ? 'block' : 'none';
+                if (manualEpochs) manualEpochs.style.display = visible ? 'block' : 'none';
+            }
+
+            document.getElementById('run-manual').addEventListener('click', function() {
+                setManualOptionsVisibility(true);
+            });
+
+            document.getElementById('run-recommended').addEventListener('click', function() {
+                setManualOptionsVisibility(false);
+            });
+
+            document.getElementById('run-bayesian').addEventListener('click', function() {
+                setManualOptionsVisibility(false);
+            });
+        });
+    </script>
+</body>
+</html>
