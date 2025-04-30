@@ -1,139 +1,162 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import gzip
 import struct
 from sklearn.model_selection import KFold
 from bayes_opt import BayesianOptimization
+import os # Add os import
 
-# Load MNIST dataset
-def load_mnist_images(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_images, rows, cols = struct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num_images, rows, cols)
-    return images
+# --- 导入 NumPy 版 function.py 组件 ---
+try:
+    from function import (
+        load_mnist_data, BasicMLP_NumPy, # NumPy MLP
+        mse_loss, mse_loss_derivative, # NumPy MSE Loss
+        SGD_Optimizer, # NumPy Optimizer
+        prepare_data_loaders, get_batch, one_hot_encode # NumPy data utils
+    )
+    print("成功从 function.py (NumPy 版) 导入模块。")
+except ImportError as e:
+    print(f"无法导入 function.py (NumPy 版): {e}")
+    exit()
+# --------------------------------------
 
-def load_mnist_labels(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_labels = struct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels
+# 移除 PyTorch Device 设置
+device = 'cpu'
+print("Using device: CPU (NumPy)")
 
-# Data paths
+# Load MNIST dataset (使用 function.py 的 load_mnist_data，注释掉旧的)
+# def load_mnist_images(file_path):
+#     ...
+# def load_mnist_labels(file_path):
+#     ...
+
+# Data paths (保持不变)
 train_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-images-idx3-ubyte.gz'
 train_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-labels-idx1-ubyte.gz'
 test_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-images-idx3-ubyte.gz'
 test_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-labels-idx1-ubyte.gz'
 
-# Load and preprocess data
-train_images = load_mnist_images(train_images_path)
-train_labels = load_mnist_labels(train_labels_path)
-test_images = load_mnist_images(test_images_path)
-test_labels = load_mnist_labels(test_labels_path)
+# --- 使用 NumPy prepare_data_loaders 加载和预处理数据 ---
+print("使用 NumPy prepare_data_loaders 加载数据 (MSE -> one-hot)...")
+config_load = {
+    'model_type': 'mlp',
+    'batch_size': 64, # 稍后可在优化中调整
+    'loss_type': 'mse', # 指定 MSE 以便 prepare_data_loaders 进行 one-hot
+    'data_dir': os.path.dirname(train_images_path) # 从路径获取目录
+}
+try:
+    train_loader_info_full, test_loader_info = prepare_data_loaders(config_load)
+    print(f"NumPy 数据加载完成。")
+except FileNotFoundError as e:
+     print(f"错误: {e}")
+     exit()
+# 移除旧的 PyTorch 加载和预处理代码
+# train_images = load_mnist_images(train_images_path)
+# ... (PyTorch tensor conversion and DataLoader)
+# ---------------------------------------------------------
 
-train_images = torch.tensor(train_images, dtype=torch.float32) / 255.0
-test_images = torch.tensor(test_images, dtype=torch.float32) / 255.0
-train_labels = torch.tensor(train_labels, dtype=torch.long)
-test_labels = torch.tensor(test_labels, dtype=torch.long)
+# Define MLP model with configurable nHidden (使用 NumPy BasicMLP_NumPy)
+# 移除 PyTorch MLP 定义
+# class BasicMLP(nn.Module):
+#     ...
+print("使用 NumPy 版 BasicMLP_NumPy 模型。")
 
-train_images = train_images.view(-1, 28 * 28)
-test_images = test_images.view(-1, 28 * 28)
 
-def to_one_hot(labels, num_classes=10):
-    return torch.eye(num_classes)[labels]
-
-train_labels_one_hot = to_one_hot(train_labels)
-test_labels_one_hot = to_one_hot(test_labels)
-
-test_dataset = torch.utils.data.TensorDataset(test_images, test_labels_one_hot)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-# Define MLP model with configurable nHidden
-class BasicMLP(nn.Module):
-    def __init__(self, nHidden):
-        super(BasicMLP, self).__init__()
-        layers = []
-        input_dim = 28 * 28
-        for hidden_units in nHidden:
-            layers.append(nn.Linear(input_dim, hidden_units))
-            layers.append(nn.Sigmoid())
-            input_dim = hidden_units
-        layers.append(nn.Linear(input_dim, 10))
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
-
-# Training function
-def train(model, train_loader, criterion, optimizer, num_epochs):
-    model.train()
+# Training function (NumPy version for MSE)
+def train_numpy(model, loader_info, loss_fn, loss_deriv_fn, optimizer, num_epochs):
+    model.set_training_mode(True)
     for epoch in range(num_epochs):
         running_loss = 0.0
-        for i, (images, labels) in enumerate(train_loader):
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-            if (i + 1) % 100 == 0:
-                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {running_loss/100:.4f}')
-                running_loss = 0.0
+        indices = np.arange(loader_info['num_samples'])
+        if loader_info['shuffle']:
+            np.random.shuffle(indices)
+        for i in range(loader_info['num_batches']):
+            batch_images, batch_labels_one_hot = get_batch(loader_info, i, indices)
 
-# Testing function
-def test(model, test_loader):
-    model.eval()
+            logits = model.forward(batch_images)
+            loss = loss_fn(logits, batch_labels_one_hot)
+            grad_loss = loss_deriv_fn(logits, batch_labels_one_hot)
+            model.backward(grad_loss)
+            optimizer.step()
+
+            running_loss += loss
+            if (i + 1) % 100 == 0:
+                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{loader_info["num_batches"]}], Loss: {running_loss/100:.4f}')
+                running_loss = 0.0
+    model.set_training_mode(False)
+
+# Testing function (NumPy version)
+def test_numpy(model, loader_info):
+    model.set_training_mode(False)
     correct = 0
     total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            _, true_labels = torch.max(labels, 1)
-            total += true_labels.size(0)
-            correct += (predicted == true_labels).sum().item()
+    for i in range(loader_info['num_batches']):
+        images, labels_one_hot = get_batch(loader_info, i)
+        logits = model.forward(images)
+        predicted_indices = np.argmax(logits, axis=1)
+        true_indices = np.argmax(labels_one_hot, axis=1) # Labels are one-hot for MSE
+        total += true_indices.shape[0]
+        correct += np.sum(predicted_indices == true_indices)
     accuracy = 100 * correct / total
     return accuracy
 
-# Define nHidden candidates
+# Define nHidden candidates (保持不变)
 nHidden_candidates = [
     [128],          # One hidden layer with 128 neurons
     [256, 128],     # Two hidden layers with 256 and 128 neurons
     [512, 256, 128] # Three hidden layers with 512, 256, and 128 neurons
 ]
 
-# Objective function for Bayesian optimization
-def objective(lr, num_epochs, batch_size, k_folds, nHidden_index):
+# Objective function for Bayesian optimization (NumPy version)
+def objective_numpy(lr, num_epochs, batch_size, k_folds, nHidden_index):
     num_epochs = int(num_epochs)
     batch_size = int(batch_size)
     k_folds = int(k_folds)
-    nHidden_index = int(nHidden_index)
+    nHidden_index = int(np.round(nHidden_index)) # Handle potential float index
+    if not 0 <= nHidden_index < len(nHidden_candidates):
+         print(f"警告: 无效 nHidden_index ({nHidden_index}), 使用 0.")
+         nHidden_index = 0
     nHidden = nHidden_candidates[nHidden_index]
 
-    torch.manual_seed(42)
+    # Use full training data loaded earlier for K-Fold split
+    all_train_images = train_loader_info_full['images']
+    all_train_labels = train_loader_info_full['labels'] # Already one-hot
+    n_samples = train_loader_info_full['num_samples']
+    batch_size_fold = int(batch_size)
+
+    np.random.seed(42)
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     fold_accuracies = []
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(train_images)):
+    for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(n_samples))):
         print(f'Fold {fold+1}/{k_folds}')
-        train_images_fold = train_images[train_idx]
-        train_labels_fold = train_labels_one_hot[train_idx]
-        val_images_fold = train_images[val_idx]
-        val_labels_fold = train_labels_one_hot[val_idx]
+        # Create fold loader info
+        fold_train_loader_info = {
+            'images': all_train_images[train_idx],
+            'labels': all_train_labels[train_idx],
+            'batch_size': batch_size_fold,
+            'num_samples': len(train_idx),
+            'num_batches': int(np.ceil(len(train_idx) / batch_size_fold)),
+            'shuffle': True,
+            'use_one_hot': True,
+            'num_classes': 10
+        }
+        fold_val_loader_info = {
+            'images': all_train_images[val_idx],
+            'labels': all_train_labels[val_idx],
+            'batch_size': batch_size_fold,
+            'num_samples': len(val_idx),
+            'num_batches': int(np.ceil(len(val_idx) / batch_size_fold)),
+            'shuffle': False,
+            'use_one_hot': True,
+            'num_classes': 10
+        }
 
-        train_dataset_fold = torch.utils.data.TensorDataset(train_images_fold, train_labels_fold)
-        val_dataset_fold = torch.utils.data.TensorDataset(val_images_fold, val_labels_fold)
+        model = BasicMLP_NumPy(nHidden=nHidden, activation_fn='sigmoid') # Assuming Sigmoid based on original
+        loss_fn_mse, loss_deriv_fn_mse = mse_loss, mse_loss_derivative
+        optimizer = SGD_Optimizer(model, learning_rate=lr, momentum=0.0) # No momentum optimized here
 
-        train_loader_fold = torch.utils.data.DataLoader(train_dataset_fold, batch_size=batch_size, shuffle=True)
-        val_loader_fold = torch.utils.data.DataLoader(val_dataset_fold, batch_size=batch_size, shuffle=False)
-
-        model = BasicMLP(nHidden)
-        criterion = nn.MSELoss()
-        optimizer = optim.SGD(model.parameters(), lr=lr)
-
-        train(model, train_loader_fold, criterion, optimizer, num_epochs)
-        val_accuracy = test(model, val_loader_fold)
+        train_numpy(model, fold_train_loader_info, loss_fn_mse, loss_deriv_fn_mse, optimizer, num_epochs)
+        val_accuracy = test_numpy(model, fold_val_loader_info)
         fold_accuracies.append(val_accuracy)
         print(f'Fold {fold+1} Validation Accuracy: {val_accuracy:.2f}%')
 
@@ -141,52 +164,57 @@ def objective(lr, num_epochs, batch_size, k_folds, nHidden_index):
     print(f'Average Validation Accuracy: {avg_val_accuracy:.2f}%')
     return avg_val_accuracy
 
-# Set up Bayesian optimization
+# Set up Bayesian optimization (Bounds might need tuning for NumPy)
 pbounds = {
-    'lr': (0.001, 0.1),
+    'lr': (0.001, 0.2), # NumPy might need higher LR
     'num_epochs': (5, 15),
     'batch_size': (16, 128),
     'k_folds': (3, 5),
-    'nHidden_index': (0, len(nHidden_candidates) - 1)
+    'nHidden_index': (0, len(nHidden_candidates) - 0.01) # Use index range
 }
 
-optimizer = BayesianOptimization(f=objective, pbounds=pbounds, random_state=42)
+bo_optimizer = BayesianOptimization(f=objective_numpy, pbounds=pbounds, random_state=42, verbose=2)
 
 # Run Bayesian optimization
-print("Starting Bayesian Optimization...")
-optimizer.maximize(init_points=5, n_iter=10)
+print("Starting Bayesian Optimization (NumPy)...")
+bo_optimizer.maximize(init_points=5, n_iter=10)
 
 # Print best hyperparameters
-print("\n=== Best Hyperparameters ===")
-best_params = optimizer.max
+print("\n=== Best Hyperparameters (NumPy) ===")
+best_params = bo_optimizer.max
 print(f"Best Average Validation Accuracy: {best_params['target']:.2f}%")
 print(f"Best Parameters: {best_params['params']}")
 
-# Train final model with best parameters
-def train_final_model(params):
-    print("\nTraining final model with best hyperparameters...")
-    torch.manual_seed(42)
+# Train final model with best parameters (NumPy version)
+def train_final_model_numpy(params):
+    print("\nTraining final model with best hyperparameters (NumPy)...")
+    np.random.seed(42)
 
     lr = params['lr']
     num_epochs = int(params['num_epochs'])
     batch_size = int(params['batch_size'])
-    nHidden_index = int(params['nHidden_index'])
-    nHidden = nHidden_candidates[nHidden_index]  # Select the best nHidden configuration
+    nHidden_index = int(np.round(params['nHidden_index']))
+    if not 0 <= nHidden_index < len(nHidden_candidates):
+         nHidden_index = 0
+    nHidden = nHidden_candidates[nHidden_index]
 
     print(f"Selected nHidden configuration: {nHidden}")
 
-    train_dataset = torch.utils.data.TensorDataset(train_images, train_labels_one_hot)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # Create final train loader info with optimized batch size
+    final_train_loader_info = train_loader_info_full.copy()
+    final_train_loader_info['batch_size'] = batch_size
+    final_train_loader_info['num_batches'] = int(np.ceil(final_train_loader_info['num_samples'] / batch_size))
 
-    final_model = BasicMLP(nHidden)
-    criterion = nn.MSELoss()
-    optimizer = optim.SGD(final_model.parameters(), lr=lr)
+    final_model = BasicMLP_NumPy(nHidden=nHidden, activation_fn='sigmoid')
+    loss_fn_mse, loss_deriv_fn_mse = mse_loss, mse_loss_derivative
+    optimizer = SGD_Optimizer(final_model, learning_rate=lr, momentum=0.0)
 
-    train(final_model, train_loader, criterion, optimizer, num_epochs)
+    train_numpy(final_model, final_train_loader_info, loss_fn_mse, loss_deriv_fn_mse, optimizer, num_epochs)
 
-    print("\nTesting the final model on the test set...")
-    test_accuracy = test(final_model, test_loader)
+    print("\nTesting the final model on the test set (NumPy)...")
+    # Use the test_loader_info prepared earlier
+    test_accuracy = test_numpy(final_model, test_loader_info)
     print(f'Final Test Accuracy with best parameters: {test_accuracy:.2f}%')
 
 # Train the final model with best parameters
-train_final_model(best_params['params'])
+train_final_model_numpy(best_params['params'])

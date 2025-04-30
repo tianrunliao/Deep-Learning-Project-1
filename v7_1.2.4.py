@@ -1,270 +1,305 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import gzip
 import struct
 from sklearn.model_selection import KFold
 from bayes_opt import BayesianOptimization
 import pandas as pd
+import os
+
+# --- 导入 NumPy 版 function.py 组件 ---
+try:
+    from function import (
+        load_mnist_data, BasicMLP_NumPy, # NumPy MLP
+        cross_entropy_loss, cross_entropy_loss_derivative, # NumPy Cross Entropy Loss
+        SGD_Optimizer, # NumPy Optimizer
+        prepare_data_loaders, get_batch, # NumPy data utils (no one_hot_encode needed)
+        LinearLayer # Import LinearLayer to access weights for L1
+    )
+    print("成功从 function.py (NumPy 版) 导入模块。")
+except ImportError as e:
+    print(f"无法导入 function.py (NumPy 版): {e}")
+    exit()
+# --------------------------------------
+
+# 移除 PyTorch Device 设置
+device = 'cpu'
+print("Using device: CPU (NumPy)")
 
 
-# Load MNIST dataset
-def load_mnist_images(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_images, rows, cols = struct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num_images, rows, cols)
-    return images
+# 移除 PyTorch MNIST 加载函数
+# def load_mnist_images(file_path): ...
+# def load_mnist_labels(file_path): ...
 
 
-def load_mnist_labels(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_labels = struct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels
-
-
-# Data paths
+# Data paths (保持不变)
 train_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-images-idx3-ubyte.gz'
 train_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-labels-idx1-ubyte.gz'
 test_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-images-idx3-ubyte.gz'
 test_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-labels-idx1-ubyte.gz'
 
-# Load and preprocess data
-train_images = load_mnist_images(train_images_path)
-train_labels = load_mnist_labels(train_labels_path)
-test_images = load_mnist_images(test_images_path)
-test_labels = load_mnist_labels(test_labels_path)
+# --- 使用 NumPy prepare_data_loaders 加载和预处理数据 (Cross Entropy -> label indices) ---
+print("使用 NumPy prepare_data_loaders 加载数据 (Cross Entropy -> label indices)...")
+config_load = {
+    'model_type': 'mlp',
+    'batch_size': 64, # Default batch size, will be overridden later if needed
+    'loss_type': 'cross_entropy', # Important: uses label indices, not one-hot
+    'data_dir': os.path.dirname(train_images_path)
+}
+try:
+    train_loader_info_full, test_loader_info = prepare_data_loaders(config_load)
+    print(f"NumPy 数据加载完成。训练标签类型: {train_loader_info_full['labels'].dtype}, 测试标签类型: {test_loader_info['labels'].dtype}")
+    print(f"训练标签示例: {train_loader_info_full['labels'][:5]}") # Check labels are indices
+except FileNotFoundError as e:
+     print(f"错误: {e}")
+     exit()
+# 移除旧的 PyTorch 加载和预处理代码
+# ...
+# ------------------------------------------------------------------------------------
 
-train_images = torch.tensor(train_images, dtype=torch.float32) / 255.0
-test_images = torch.tensor(test_images, dtype=torch.float32) / 255.0
-train_labels = torch.tensor(train_labels, dtype=torch.long)
-test_labels = torch.tensor(test_labels, dtype=torch.long)
-
-train_images = train_images.view(-1, 28 * 28)
-test_images = test_images.view(-1, 28 * 28)
-
-# No need for one-hot encoding with cross-entropy loss
-test_dataset = torch.utils.data.TensorDataset(test_images, test_labels)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-
-# Define MLP model with configurable nHidden and Dropout
-class BasicMLP(nn.Module):
-    def __init__(self, nHidden, dropout_rate=0.0):
-        super(BasicMLP, self).__init__()
-        layers = []
-        input_dim = 28 * 28
-        for hidden_units in nHidden:
-            layers.append(nn.Linear(input_dim, hidden_units))
-            layers.append(nn.Sigmoid())
-            if dropout_rate > 0:
-                layers.append(nn.Dropout(dropout_rate))
-            input_dim = hidden_units
-        layers.append(nn.Linear(input_dim, 10))
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)  # Outputs raw logits
+# 移除 PyTorch MLP 定义
+# class BasicMLP(nn.Module): ...
+print("使用 NumPy 版 BasicMLP_NumPy 模型。")
 
 
-# Training function with regularization and early stopping
-def train(model, train_loader, val_loader, criterion, optimizer, num_epochs, regularization=None, l1_lambda=0.0,
-          patience=5):
+# Training function with regularization and early stopping (NumPy version for Cross Entropy)
+def train_numpy_ce(model, loader_info, val_loader_info, loss_fn, loss_deriv_fn, optimizer, num_epochs, regularization=None, l1_lambda=0.0, patience=5):
     best_val_loss = float('inf')
     epochs_no_improve = 0
+
     for epoch in range(num_epochs):
-        model.train()
+        model.set_training_mode(True)
         running_loss = 0.0
-        for i, (images, labels) in enumerate(train_loader):
-            outputs = model(images)
-            loss = criterion(outputs, labels)  # Labels are class indices
-            if regularization == 'l1':
-                l1_norm = sum(p.abs().sum() for p in model.parameters())
+        indices = np.arange(loader_info['num_samples'])
+        if loader_info['shuffle']:
+            np.random.shuffle(indices)
+
+        for i in range(loader_info['num_batches']):
+            # Get batch with label indices
+            batch_images, batch_labels_indices = get_batch(loader_info, i, indices)
+
+            logits = model.forward(batch_images)
+            # Calculate cross-entropy loss using indices
+            loss = loss_fn(logits, batch_labels_indices)
+
+            if regularization == 'l1' and l1_lambda > 0:
+                l1_norm = 0
+                for layer in model.layers:
+                    if hasattr(layer, 'weights') and layer.weights is not None:
+                        l1_norm += np.sum(np.abs(layer.weights))
                 loss += l1_lambda * l1_norm
-            optimizer.zero_grad()
-            loss.backward()
+
+            # Backward pass needs true labels (indices)
+            grad_loss = loss_deriv_fn(logits, batch_labels_indices)
+            model.backward(grad_loss)
             optimizer.step()
-            running_loss += loss.item()
+
+            running_loss += loss
             if (i + 1) % 100 == 0:
-                print(
-                    f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], Loss: {running_loss / 100:.4f}')
+                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{loader_info["num_batches"]}], Loss: {running_loss/100:.4f}')
                 running_loss = 0.0
 
-        # Validation for early stopping
-        if regularization == 'early_stopping' and val_loader:
-            model.eval()
+        if regularization == 'early_stopping' and val_loader_info:
+            model.set_training_mode(False)
             val_loss = 0.0
-            with torch.no_grad():
-                for images, labels in val_loader:
-                    outputs = model(images)
-                    val_loss += criterion(outputs, labels).item()
-            val_loss /= len(val_loader)
-            print(f'Validation Loss: {val_loss:.4f}')
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            for i in range(val_loader_info['num_batches']):
+                val_images, val_labels_indices = get_batch(val_loader_info, i)
+                val_logits = model.forward(val_images)
+                 # Calculate validation loss using indices
+                batch_val_loss = loss_fn(val_logits, val_labels_indices)
+                val_loss += batch_val_loss
+            epoch_val_loss = val_loss / val_loader_info['num_batches']
+            print(f'Validation Loss: {epoch_val_loss:.4f}')
+            if epoch_val_loss < best_val_loss:
+                best_val_loss = epoch_val_loss
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
-                    print(f'Early stopping at epoch {epoch + 1}')
+                    print(f'Early stopping at epoch {epoch+1}')
                     break
+    model.set_training_mode(False)
 
 
-# Testing function
-def test(model, test_loader):
-    model.eval()
+# Testing function (NumPy version for Cross Entropy)
+def test_numpy_ce(model, loader_info):
+    model.set_training_mode(False)
     correct = 0
     total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+    for i in range(loader_info['num_batches']):
+        images, labels_indices = get_batch(loader_info, i) # Get batch with label indices
+        logits = model.forward(images)
+        predicted_indices = np.argmax(logits, axis=1)
+        total += labels_indices.shape[0]
+        correct += np.sum(predicted_indices == labels_indices) # Compare predicted indices with true indices
     accuracy = 100 * correct / total
     return accuracy
 
 
-# Define nHidden candidates
+# Define nHidden candidates (保持不变)
 nHidden_candidates = [
-    [128],  # One hidden layer with 128 neurons
-    [256, 128],  # Two hidden layers with 256 and 128 neurons
-    [512, 256, 128]  # Three hidden layers with 512, 256, and 128 neurons
+    [128],
+    [256, 128],
+    [512, 256, 128]
 ]
 
 
-# Objective function for Bayesian optimization with regularization
-def objective(lr, num_epochs, batch_size, k_folds, nHidden_index, momentum, dropout_rate, l1_lambda, weight_decay):
+# Objective function for Bayesian optimization with regularization (NumPy version, Cross Entropy, L2 removed)
+def objective_numpy(lr, num_epochs, batch_size, k_folds, nHidden_index, momentum, dropout_rate, l1_lambda):
     num_epochs = int(num_epochs)
     batch_size = int(batch_size)
     k_folds = int(k_folds)
-    nHidden_index = int(nHidden_index)
+    nHidden_index = int(np.round(nHidden_index)) # Use round for float index
+    if not 0 <= nHidden_index < len(nHidden_candidates):
+         nHidden_index = 0 # Default to first candidate if index is out of bounds
     nHidden = nHidden_candidates[nHidden_index]
-    regularization_types = ['none', 'l1', 'l2', 'dropout', 'early_stopping']
+
+    # L2 (weight_decay) is removed
+    regularization_types = ['none', 'l1', 'dropout', 'early_stopping']
     fold_accuracies = {reg: [] for reg in regularization_types}
 
-    torch.manual_seed(42)
+    all_train_images = train_loader_info_full['images']
+    all_train_labels = train_loader_info_full['labels'] # Use label indices
+    n_samples = train_loader_info_full['num_samples']
+    batch_size_fold = int(batch_size)
+
+    np.random.seed(42)
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(train_images)):
-        print(f'Fold {fold + 1}/{k_folds}')
-        train_images_fold = train_images[train_idx]
-        train_labels_fold = train_labels[train_idx]
-        val_images_fold = train_images[val_idx]
-        val_labels_fold = train_labels[val_idx]
-
-        train_dataset_fold = torch.utils.data.TensorDataset(train_images_fold, train_labels_fold)
-        val_dataset_fold = torch.utils.data.TensorDataset(val_images_fold, val_labels_fold)
-
-        train_loader_fold = torch.utils.data.DataLoader(train_dataset_fold, batch_size=batch_size, shuffle=True)
-        val_loader_fold = torch.utils.data.DataLoader(val_dataset_fold, batch_size=batch_size, shuffle=False)
+    for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(n_samples))):
+        print(f'Fold {fold+1}/{k_folds}')
+        # Create fold loader info (using label indices)
+        fold_train_loader_info = {
+            'images': all_train_images[train_idx], 'labels': all_train_labels[train_idx],
+            'batch_size': batch_size_fold, 'num_samples': len(train_idx),
+            'num_batches': int(np.ceil(len(train_idx) / batch_size_fold)),
+            'shuffle': True, 'use_one_hot': False # Use label indices
+        }
+        fold_val_loader_info = {
+            'images': all_train_images[val_idx], 'labels': all_train_labels[val_idx],
+            'batch_size': batch_size_fold, 'num_samples': len(val_idx),
+            'num_batches': int(np.ceil(len(val_idx) / batch_size_fold)),
+            'shuffle': False, 'use_one_hot': False # Use label indices
+        }
 
         for reg in regularization_types:
             print(f'Training with {reg} regularization')
-            if reg == 'dropout':
-                model = BasicMLP(nHidden, dropout_rate=dropout_rate)
-            else:
-                model = BasicMLP(nHidden)
+            current_dropout_rate = dropout_rate if reg == 'dropout' else 0.0
+            # Use 'softmax' activation at the end for Cross Entropy
+            model = BasicMLP_NumPy(nHidden=nHidden, dropout_rate=current_dropout_rate, activation_fn='sigmoid', output_activation='softmax')
 
-            criterion = nn.CrossEntropyLoss()  # Use cross-entropy loss
-            if reg == 'l2':
-                optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-            else:
-                optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+            # Use NumPy Cross Entropy loss and derivative
+            loss_fn_ce, loss_deriv_fn_ce = cross_entropy_loss, cross_entropy_loss_derivative
+            # Optimizer doesn't support weight_decay
+            optimizer = SGD_Optimizer(model, learning_rate=lr, momentum=momentum)
 
-            train(model, train_loader_fold, val_loader_fold if reg == 'early_stopping' else None,
-                  criterion, optimizer, num_epochs, regularization=reg, l1_lambda=l1_lambda if reg == 'l1' else 0.0)
-            val_accuracy = test(model, val_loader_fold)
+            # Train using the CE version
+            train_numpy_ce(model, fold_train_loader_info, fold_val_loader_info if reg == 'early_stopping' else None,
+                           loss_fn_ce, loss_deriv_fn_ce, optimizer, num_epochs, regularization=reg, l1_lambda=l1_lambda if reg == 'l1' else 0.0, patience=5)
+            # Test using the CE version
+            val_accuracy = test_numpy_ce(model, fold_val_loader_info)
             fold_accuracies[reg].append(val_accuracy)
-            print(f'Fold {fold + 1} {reg} Validation Accuracy: {val_accuracy:.2f}%')
+            print(f'Fold {fold+1} {reg} Validation Accuracy: {val_accuracy:.2f}%')
 
     avg_val_accuracies = {reg: np.mean(acc) for reg, acc in fold_accuracies.items()}
     for reg, avg_acc in avg_val_accuracies.items():
         print(f'Average {reg} Validation Accuracy: {avg_acc:.2f}%')
-    return avg_val_accuracies['none']  # Optimize based on no regularization as baseline
+    # Optimize based on no regularization as baseline
+    return avg_val_accuracies.get('none', 0.0)
 
 
-# Set up Bayesian optimization with extended hyperparameter space
+# Set up Bayesian optimization (remove weight_decay)
 pbounds = {
-    'lr': (0.001, 0.1),
+    'lr': (0.001, 0.2), # Adjusted lr range based on previous examples
     'num_epochs': (5, 15),
     'batch_size': (16, 128),
     'k_folds': (3, 5),
-    'nHidden_index': (0, len(nHidden_candidates) - 1),
-    'momentum': (0.5, 0.99),
+    'nHidden_index': (0, len(nHidden_candidates) - 0.01), # Use float index
+    'momentum': (0.0, 0.99), # Adjusted momentum range
     'dropout_rate': (0.0, 0.5),
-    'l1_lambda': (0.0001, 0.01),
-    'weight_decay': (0.0001, 0.01)  # For L2 regularization
+    'l1_lambda': (0.00001, 0.001) # Adjusted L1 range
+    # 'weight_decay': (0.0001, 0.01) # Removed
 }
 
-optimizer = BayesianOptimization(f=objective, pbounds=pbounds, random_state=42)
+# Use renamed objective function
+bo_optimizer = BayesianOptimization(f=objective_numpy, pbounds=pbounds, random_state=42, verbose=2)
 
 # Run Bayesian optimization
-print("Starting Bayesian Optimization...")
-optimizer.maximize(init_points=5, n_iter=10)
+print("Starting Bayesian Optimization (NumPy - Cross Entropy)...")
+bo_optimizer.maximize(init_points=5, n_iter=10)
 
 # Print best hyperparameters
-print("\n=== Best Hyperparameters ===")
-best_params = optimizer.max
+print("\n=== Best Hyperparameters (NumPy - Cross Entropy) ===")
+best_params = bo_optimizer.max
 print(f"Best Average Validation Accuracy (no regularization): {best_params['target']:.2f}%")
 print(f"Best Parameters: {best_params['params']}")
 
 
-# Train final model with best parameters and compare regularizations
-def train_final_model(params):
-    print("\nTraining final model with best hyperparameters...")
-    torch.manual_seed(42)
+# Train final model with best parameters and compare regularizations (NumPy version, Cross Entropy)
+def train_final_model_numpy_ce(params):
+    print("\nTraining final model with best hyperparameters (NumPy - Cross Entropy)...")
+    np.random.seed(42)
 
     lr = params['lr']
     num_epochs = int(params['num_epochs'])
     batch_size = int(params['batch_size'])
-    nHidden_index = int(params['nHidden_index'])
+    nHidden_index = int(np.round(params['nHidden_index'])) # Use round
+    if not 0 <= nHidden_index < len(nHidden_candidates):
+         nHidden_index = 0
+    nHidden = nHidden_candidates[nHidden_index]
     momentum = params['momentum']
     dropout_rate = params['dropout_rate']
     l1_lambda = params['l1_lambda']
-    weight_decay = params['weight_decay']
-    nHidden = nHidden_candidates[nHidden_index]
+    # weight_decay removed
 
     print(f"Selected nHidden configuration: {nHidden}")
     print(f"Selected momentum: {momentum}")
     print(f"Selected dropout_rate: {dropout_rate}")
     print(f"Selected l1_lambda: {l1_lambda}")
-    print(f"Selected weight_decay: {weight_decay}")
+    # print(f"Selected weight_decay: {weight_decay}") # Removed
 
-    train_dataset = torch.utils.data.TensorDataset(train_images, train_labels)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataset = torch.utils.data.TensorDataset(train_images, train_labels)  # Using train as val for simplicity
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    # Final loader info (using label indices)
+    final_train_loader_info = train_loader_info_full.copy()
+    final_train_loader_info['batch_size'] = batch_size
+    final_train_loader_info['num_batches'] = int(np.ceil(final_train_loader_info['num_samples'] / batch_size))
+    final_train_loader_info['shuffle'] = True # Ensure shuffling for final training
+    final_train_loader_info['use_one_hot'] = False
+    final_val_loader_info = final_train_loader_info # Use train as val
 
-    regularization_types = ['none', 'l1', 'l2', 'dropout', 'early_stopping']
+    # Use modified test loader info as well (for consistency, although accuracy doesn't depend on batch size here)
+    final_test_loader_info = test_loader_info.copy()
+    final_test_loader_info['batch_size'] = batch_size
+    final_test_loader_info['num_batches'] = int(np.ceil(final_test_loader_info['num_samples'] / batch_size))
+    final_test_loader_info['use_one_hot'] = False
+
+
+    regularization_types = ['none', 'l1', 'dropout', 'early_stopping'] # Removed 'l2'
     results = {}
 
     for reg in regularization_types:
-        print(f"\nRunning final model with {reg} regularization")
-        if reg == 'dropout':
-            model = BasicMLP(nHidden, dropout_rate=dropout_rate)
-        else:
-            model = BasicMLP(nHidden)
+        print(f"
+Running final model with {reg} regularization")
+        current_dropout_rate = dropout_rate if reg == 'dropout' else 0.0
+        # Use 'softmax' output activation
+        model = BasicMLP_NumPy(nHidden=nHidden, dropout_rate=current_dropout_rate, activation_fn='sigmoid', output_activation='softmax')
 
-        criterion = nn.CrossEntropyLoss()  # Use cross-entropy loss
-        if reg == 'l2':
-            optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-        else:
-            optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+        # Use NumPy Cross Entropy loss and derivative
+        loss_fn_ce, loss_deriv_fn_ce = cross_entropy_loss, cross_entropy_loss_derivative
+        # Optimizer doesn't support weight_decay
+        optimizer = SGD_Optimizer(model, learning_rate=lr, momentum=momentum)
 
-        train(model, train_loader, val_loader if reg == 'early_stopping' else None,
-              criterion, optimizer, num_epochs, regularization=reg, l1_lambda=l1_lambda if reg == 'l1' else 0.0)
+        # Train using the CE version
+        train_numpy_ce(model, final_train_loader_info, final_val_loader_info if reg == 'early_stopping' else None,
+                       loss_fn_ce, loss_deriv_fn_ce, optimizer, num_epochs, regularization=reg, l1_lambda=l1_lambda if reg == 'l1' else 0.0, patience=5)
 
-        test_accuracy = test(model, test_loader)
+        # Test using the CE version and final test loader info
+        test_accuracy = test_numpy_ce(model, final_test_loader_info)
         results[reg] = test_accuracy
         print(f'Final Test Accuracy with {reg}: {test_accuracy:.2f}%')
 
     # Create and print results table
     df = pd.DataFrame(list(results.items()), columns=['Regularization', 'Test Accuracy (%)'])
-    print("\n=== Final Results Table ===")
+    print("\n=== Final Results Table (NumPy - Cross Entropy - L2 Excluded) ===")
     print(df)
 
-
-# Train the final model with best parameters
-train_final_model(best_params['params'])
+# Train the final model with best parameters using the CE version
+train_final_model_numpy_ce(best_params['params'])

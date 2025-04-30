@@ -1,1009 +1,1294 @@
-import torch
-import torch.nn as nn
-import gzip
 import numpy as np
+import gzip
 import struct
 from scipy.ndimage import shift, rotate, zoom
-from torch.utils.data import DataLoader, TensorDataset
-from torchvision import transforms
 from sklearn.model_selection import KFold
-from bayes_opt import BayesianOptimization
 import pandas as pd
+import os # 添加 os 导入，用于 get_user_input_path
 
-# --- GPU 相关辅助函数 ---
+# --- NumPy 基础组件 ---
 
-def setup_gpu():
-    """设置并检查GPU可用性"""
-    if not torch.cuda.is_available():
-        print("警告: 未检测到可用的CUDA设备，将使用CPU运行")
-        return False, 'cpu'
-    
-    # 获取可用的GPU数量
-    gpu_count = torch.cuda.device_count()
-    print(f"检测到 {gpu_count} 个GPU设备")
-    
-    # 打印GPU信息
-    for i in range(gpu_count):
-        gpu_name = torch.cuda.get_device_name(i)
-        total_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3  # GB
-        print(f"GPU {i}: {gpu_name}，内存: {total_memory:.2f} GB")
-    
-    # 设置设备为第一个GPU
-    device = 'cuda:0'
-    torch.cuda.set_device(0)
-    print(f"使用设备: {device}")
-    
-    # 打印当前GPU内存使用情况
-    print_gpu_memory_usage()
-    
-    return True, device
+def sigmoid(x):
+    """Sigmoid 激活函数"""
+    # 防止 overflow
+    x = np.clip(x, -500, 500)
+    return 1 / (1 + np.exp(-x))
 
-def print_gpu_memory_usage():
-    """打印当前GPU内存使用情况"""
-    if torch.cuda.is_available():
-        current_device = torch.cuda.current_device()
-        total_memory = torch.cuda.get_device_properties(current_device).total_memory / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved(current_device) / 1024**3  # GB
-        allocated = torch.cuda.memory_allocated(current_device) / 1024**3  # GB
-        free = total_memory - allocated
-        
-        print(f"GPU内存使用: 总计 {total_memory:.2f} GB, 已分配 {allocated:.2f} GB, 预留 {reserved:.2f} GB, 可用 {free:.2f} GB")
+def sigmoid_derivative(x):
+    """Sigmoid 激活函数的导数"""
+    s = sigmoid(x)
+    return s * (1 - s)
 
-def clear_gpu_memory():
-    """清理GPU缓存以释放内存"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print("已清理GPU缓存")
-        print_gpu_memory_usage()
+def relu(x):
+    """ReLU 激活函数"""
+    return np.maximum(0, x)
 
-# MLP 模型
-class BasicMLP(nn.Module):
+def relu_derivative(x):
+    """ReLU 激活函数的导数"""
+    return (x > 0).astype(float)
+
+def tanh(x):
+    """Tanh 激活函数"""
+    return np.tanh(x)
+
+def tanh_derivative(x):
+    """Tanh 激活函数的导数"""
+    return 1 - np.tanh(x)**2
+
+def leaky_relu(x, alpha=0.1):
+    """Leaky ReLU 激活函数"""
+    return np.where(x > 0, x, x * alpha)
+
+def leaky_relu_derivative(x, alpha=0.1):
+    """Leaky ReLU 激活函数的导数"""
+    return np.where(x > 0, 1, alpha)
+
+def softmax(x):
+    """Softmax 函数，处理数值稳定性"""
+    # axis=1 表示对每一行（每个样本）进行 softmax
+    # keepdims=True 保持维度以便广播
+    e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+    return e_x / np.sum(e_x, axis=1, keepdims=True)
+
+def cross_entropy_loss(y_pred_softmax, y_true_indices):
+    """
+    计算交叉熵损失
+
+    Args:
+        y_pred_softmax: shape (N, C)，经过 softmax 的预测概率
+        y_true_indices: shape (N,)，真实的类别索引
+
+    Returns:
+        平均交叉熵损失
+    """
+    n_samples = y_true_indices.shape[0]
+    # 获取对应正确类别的预测概率
+    correct_logprobs = -np.log(y_pred_softmax[np.arange(n_samples), y_true_indices] + 1e-9) # 加个小数防止log(0)
+    loss = np.sum(correct_logprobs) / n_samples
+    return loss
+
+def cross_entropy_loss_derivative(y_pred_softmax, y_true_indices):
+    """
+    计算交叉熵损失相对于 softmax 输入（logits）的梯度
+
+    Args:
+        y_pred_softmax: shape (N, C)，经过 softmax 的预测概率
+        y_true_indices: shape (N,)，真实的类别索引
+
+    Returns:
+        梯度 dLoss/dLogits，shape (N, C)
+    """
+    n_samples = y_true_indices.shape[0]
+    # 创建 one-hot 编码的真实标签
+    y_true_one_hot = np.zeros_like(y_pred_softmax)
+    y_true_one_hot[np.arange(n_samples), y_true_indices] = 1
+
+    # 梯度是 (y_pred_softmax - y_true_one_hot) / N
+    grad = (y_pred_softmax - y_true_one_hot) / n_samples
+    return grad
+
+def mse_loss(y_pred, y_true_one_hot):
+    """计算均方误差损失"""
+    n_samples = y_true_one_hot.shape[0]
+    loss = np.sum((y_pred - y_true_one_hot)**2) / (2 * n_samples)
+    return loss
+
+def mse_loss_derivative(y_pred, y_true_one_hot):
+    """计算均方误差损失的梯度"""
+    n_samples = y_true_one_hot.shape[0]
+    grad = (y_pred - y_true_one_hot) / n_samples
+    return grad
+
+def one_hot_encode(labels, num_classes):
+    """将类别索引转换为 one-hot 编码"""
+    n_samples = labels.shape[0]
+    one_hot = np.zeros((n_samples, num_classes))
+    one_hot[np.arange(n_samples), labels] = 1
+    return one_hot
+
+
+# --- NumPy 实现的 MLP 层 ---
+class LinearLayer:
+    def __init__(self, input_dim, output_dim):
+        # He 初始化 / Xavier 初始化（简化版）
+        limit = np.sqrt(6 / (input_dim + output_dim))
+        self.weights = np.random.uniform(-limit, limit, (input_dim, output_dim))
+        # self.weights = np.random.randn(input_dim, output_dim) * np.sqrt(2.0 / input_dim) # He
+        self.biases = np.zeros((1, output_dim))
+        self.input = None
+        self.grad_weights = None
+        self.grad_biases = None
+        self.grad_input = None
+
+    def forward(self, input_data):
+        """前向传播"""
+        self.input = input_data
+        # (N, input_dim) @ (input_dim, output_dim) + (1, output_dim) -> (N, output_dim)
+        output = np.dot(self.input, self.weights) + self.biases
+        return output
+
+    def backward(self, grad_output):
+        """
+        反向传播
+
+        Args:
+            grad_output: 输出层的梯度 (dLoss / dOutput)，shape (N, output_dim)
+
+        Returns:
+            输入层的梯度 (dLoss / dInput)，shape (N, input_dim)
+        """
+        # 计算权重的梯度: dLoss/dW = dLoss/dOutput * dOutput/dW = grad_output^T * input
+        # (input_dim, N) @ (N, output_dim) -> (input_dim, output_dim)
+        self.grad_weights = np.dot(self.input.T, grad_output)
+
+        # 计算偏置的梯度: dLoss/dB = dLoss/dOutput * dOutput/dB = sum(grad_output, axis=0)
+        # (N, output_dim) -> (1, output_dim)
+        self.grad_biases = np.sum(grad_output, axis=0, keepdims=True)
+
+        # 计算输入的梯度: dLoss/dInput = dLoss/dOutput * dOutput/dInput = grad_output @ W^T
+        # (N, output_dim) @ (output_dim, input_dim) -> (N, input_dim)
+        self.grad_input = np.dot(grad_output, self.weights.T)
+
+        return self.grad_input
+
+    def update(self, learning_rate):
+        """使用 SGD 更新权重和偏置"""
+        self.weights -= learning_rate * self.grad_weights
+        self.biases -= learning_rate * self.grad_biases
+
+class ActivationLayer:
+    def __init__(self, activation_fn_name):
+        self.activation_fn_name = activation_fn_name.lower()
+        self.input = None
+        self.grad_input = None
+
+        activations = {
+            'relu': (relu, relu_derivative),
+            'sigmoid': (sigmoid, sigmoid_derivative),
+            'tanh': (tanh, tanh_derivative),
+            'leaky_relu': (leaky_relu, leaky_relu_derivative)
+            # 可以添加更多
+        }
+        if self.activation_fn_name not in activations:
+            raise ValueError(f"不支持的激活函数: {activation_fn_name}")
+        self.activation_fn, self.activation_derivative = activations[self.activation_fn_name]
+
+    def forward(self, input_data):
+        """前向传播"""
+        self.input = input_data
+        output = self.activation_fn(self.input)
+        return output
+
+    def backward(self, grad_output):
+        """
+        反向传播
+
+        Args:
+            grad_output: 输出层的梯度 (dLoss / dOutput)，shape (N, layer_dim)
+
+        Returns:
+            输入层的梯度 (dLoss / dInput)，shape (N, layer_dim)
+        """
+        # 梯度: dLoss/dInput = dLoss/dOutput * dOutput/dInput
+        # dOutput/dInput 是激活函数的导数
+        self.grad_input = grad_output * self.activation_derivative(self.input)
+        return self.grad_input
+
+    def update(self, learning_rate):
+        # 激活层没有参数需要更新
+        pass
+
+
+class DropoutLayer:
+    def __init__(self, dropout_rate):
+        self.dropout_rate = dropout_rate
+        self.mask = None
+        self.is_training = True # 训练时启用 dropout，测试时禁用
+
+    def forward(self, input_data):
+        if not self.is_training or self.dropout_rate == 0:
+            return input_data
+
+        # 生成 dropout mask
+        self.mask = (np.random.rand(*input_data.shape) > self.dropout_rate) / (1.0 - self.dropout_rate)
+        # 应用 mask
+        output = input_data * self.mask
+        return output
+
+    def backward(self, grad_output):
+        if not self.is_training or self.dropout_rate == 0:
+            return grad_output
+        # 将梯度乘以相同的 mask
+        grad_input = grad_output * self.mask
+        return grad_input
+
+    def update(self, learning_rate):
+        # Dropout 层没有参数需要更新
+        pass
+
+    def set_training_mode(self, is_training):
+        self.is_training = is_training
+
+
+# --- NumPy 实现的 CNN 层 ---
+
+class ConvLayer:
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+        # He 初始化 (简化)
+        limit = np.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
+        self.weights = np.random.randn(out_channels, in_channels, kernel_size, kernel_size) * limit
+        self.biases = np.zeros((out_channels, 1)) # 每个输出通道一个偏置
+
+        self.input = None
+        self.input_padded = None # 存储填充后的输入
+        self.grad_weights = None
+        self.grad_biases = None
+        self.grad_input = None
+
+    def forward(self, input_data):
+        """前向传播 (N, C_in, H_in, W_in) -> (N, C_out, H_out, W_out)"""
+        self.input = input_data
+        N, C_in, H_in, W_in = input_data.shape
+        assert C_in == self.in_channels, "输入通道数与层定义不符"
+
+        # 计算输出尺寸
+        H_out = (H_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+        W_out = (W_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+
+        # 添加 Padding
+        if self.padding > 0:
+            self.input_padded = np.pad(input_data, ((0, 0), (0, 0), (self.padding, self.padding), (self.padding, self.padding)), mode='constant', constant_values=0)
+        else:
+            self.input_padded = input_data
+
+        # 初始化输出
+        output = np.zeros((N, self.out_channels, H_out, W_out))
+
+        # 卷积计算 (使用循环，效率较低)
+        for n in range(N): # 遍历样本
+            for c_out in range(self.out_channels): # 遍历输出通道
+                for h in range(H_out): # 遍历输出高度
+                    for w in range(W_out): # 遍历输出宽度
+                        # 定位输入区域
+                        h_start = h * self.stride
+                        h_end = h_start + self.kernel_size
+                        w_start = w * self.stride
+                        w_end = w_start + self.kernel_size
+
+                        # 提取输入区域 (所有输入通道)
+                        input_slice = self.input_padded[n, :, h_start:h_end, w_start:w_end]
+
+                        # 执行卷积: (C_in, K, K) * (C_in, K, K) -> 求和
+                        conv_sum = np.sum(input_slice * self.weights[c_out, :, :, :])
+
+                        # 添加偏置
+                        output[n, c_out, h, w] = conv_sum + self.biases[c_out]
+
+        return output
+
+    def backward(self, grad_output):
+        """
+        反向传播 (N, C_out, H_out, W_out) -> (N, C_in, H_in, W_in)
+        计算 dLoss/dInput, dLoss/dWeights, dLoss/dBiases
+        """
+        N, C_out, H_out, W_out = grad_output.shape
+        _, _, H_in, W_in = self.input.shape # 原始输入尺寸
+
+        # 初始化梯度
+        self.grad_input = np.zeros_like(self.input_padded) # 梯度需要对应 padded 输入
+        self.grad_weights = np.zeros_like(self.weights)
+        self.grad_biases = np.zeros_like(self.biases)
+
+        # 计算梯度 (使用循环，效率较低)
+        for n in range(N): # 遍历样本
+            for c_out in range(self.out_channels): # 遍历输出通道
+                for h in range(H_out): # 遍历输出高度
+                    for w in range(W_out): # 遍历输出宽度
+                        # 获取当前输出位置的梯度
+                        grad = grad_output[n, c_out, h, w]
+
+                        # 定位输入区域
+                        h_start = h * self.stride
+                        h_end = h_start + self.kernel_size
+                        w_start = w * self.stride
+                        w_end = w_start + self.kernel_size
+
+                        # 提取输入区域
+                        input_slice = self.input_padded[n, :, h_start:h_end, w_start:w_end]
+
+                        # --- 计算梯度 ---
+                        # 1. dLoss/dInput: 将梯度乘权重，累加到对应输入位置
+                        self.grad_input[n, :, h_start:h_end, w_start:w_end] += self.weights[c_out, :, :, :] * grad
+
+                        # 2. dLoss/dWeights: 将梯度乘输入切片，累加到对应权重
+                        self.grad_weights[c_out, :, :, :] += input_slice * grad
+
+                        # 3. dLoss/dBiases: 将梯度累加到对应偏置
+                        self.grad_biases[c_out] += grad
+
+        # 如果有 padding，需要移除 padding 部分的梯度
+        if self.padding > 0:
+            self.grad_input = self.grad_input[:, :, self.padding:-self.padding, self.padding:-self.padding]
+
+        # 确保 grad_input 形状与原始输入一致
+        assert self.grad_input.shape == self.input.shape
+
+        return self.grad_input
+
+    def update(self, learning_rate):
+        """使用 SGD 更新权重和偏置"""
+        self.weights -= learning_rate * self.grad_weights
+        # grad_biases 是 (C_out, 1)，需要 reshape 或广播匹配 biases (C_out, 1)
+        self.biases -= learning_rate * self.grad_biases # NumPy 应该能自动广播
+
+
+class PoolingLayer:
+    def __init__(self, pool_size, stride=None, pool_type='max'):
+        self.pool_size = pool_size
+        self.stride = stride if stride is not None else pool_size # 默认 stride 等于 pool_size
+        self.pool_type = pool_type.lower()
+        if self.pool_type != 'max':
+            raise NotImplementedError("当前仅支持 Max Pooling")
+
+        self.input = None
+        self.output_shape = None
+        self.max_indices = None # 存储最大值索引用于反向传播
+        self.grad_input = None
+
+    def forward(self, input_data):
+        """前向传播 (N, C, H_in, W_in) -> (N, C, H_out, W_out)"""
+        self.input = input_data
+        N, C, H_in, W_in = input_data.shape
+
+        # 计算输出尺寸
+        H_out = (H_in - self.pool_size) // self.stride + 1
+        W_out = (W_in - self.pool_size) // self.stride + 1
+        self.output_shape = (N, C, H_out, W_out)
+
+        # 初始化输出和最大值索引存储
+        output = np.zeros(self.output_shape)
+        self.max_indices = np.zeros(self.output_shape, dtype=int) # 存储展平后的索引
+
+        # Max Pooling 计算 (使用循环)
+        for n in range(N):
+            for c in range(C):
+                for h in range(H_out):
+                    for w in range(W_out):
+                        # 定位输入区域
+                        h_start = h * self.stride
+                        h_end = h_start + self.pool_size
+                        w_start = w * self.stride
+                        w_end = w_start + self.pool_size
+
+                        # 提取输入区域
+                        input_slice = self.input[n, c, h_start:h_end, w_start:w_end]
+
+                        # 找到最大值及其在切片内的索引
+                        max_val = np.max(input_slice)
+                        max_idx_flat = np.argmax(input_slice) # 展平后的索引
+                        max_idx_row, max_idx_col = np.unravel_index(max_idx_flat, (self.pool_size, self.pool_size))
+
+                        # 存储输出和最大值在 *原始输入* 中的绝对索引 (需要转换)
+                        output[n, c, h, w] = max_val
+                        # 计算在原始 (H_in, W_in) 中的索引，然后展平成单个整数存储
+                        abs_row = h_start + max_idx_row
+                        abs_col = w_start + max_idx_col
+                        self.max_indices[n, c, h, w] = abs_row * W_in + abs_col
+
+        return output
+
+    def backward(self, grad_output):
+        """反向传播 (N, C, H_out, W_out) -> (N, C, H_in, W_in)"""
+        N, C, H_out, W_out = grad_output.shape
+        _, _, H_in, W_in = self.input.shape
+
+        # 初始化输入梯度
+        self.grad_input = np.zeros_like(self.input)
+
+        # 将梯度传递回最大值所在的位置
+        for n in range(N):
+            for c in range(C):
+                for h in range(H_out):
+                    for w in range(W_out):
+                        # 获取当前输出位置的梯度
+                        grad = grad_output[n, c, h, w]
+                        # 获取最大值在原始输入中的展平索引
+                        flat_idx = self.max_indices[n, c, h, w]
+                        # 将展平索引转换回 (row, col)
+                        idx_row, idx_col = np.unravel_index(flat_idx, (H_in, W_in))
+                        # 将梯度累加到对应位置 (如果一个位置是多个池化窗口的最大值，梯度会累加)
+                        self.grad_input[n, c, idx_row, idx_col] += grad
+
+        return self.grad_input
+
+    def update(self, learning_rate):
+        pass # 池化层无参数
+
+class FlattenLayer:
+    def __init__(self):
+        self.original_shape = None
+
+    def forward(self, input_data):
+        """前向传播 (N, C, H, W) -> (N, C*H*W)"""
+        self.original_shape = input_data.shape
+        N = self.original_shape[0]
+        # 将除 N 以外的所有维度展平
+        output = input_data.reshape(N, -1)
+        return output
+
+    def backward(self, grad_output):
+        """反向传播 (N, C*H*W) -> (N, C, H, W)"""
+        # 将梯度 reshape回原始输入的形状
+        grad_input = grad_output.reshape(self.original_shape)
+        return grad_input
+
+    def update(self, learning_rate):
+        pass # 展平层无参数
+
+
+# --- NumPy 实现的 MLP 模型 ---
+class BasicMLP_NumPy:
     def __init__(self, nHidden, dropout_rate=0.0, activation_fn='sigmoid'):
-        super(BasicMLP, self).__init__()
-        layers = []
+        self.layers = []
         input_dim = 28 * 28
-        
-        # 获取激活函数
-        activation = get_activation_function(activation_fn)
-        
-        for hidden_units in nHidden:
-            layers.append(nn.Linear(input_dim, hidden_units))
-            layers.append(activation)
+
+        for i, hidden_units in enumerate(nHidden):
+            # 添加线性层
+            self.layers.append(LinearLayer(input_dim, hidden_units))
+            # 添加激活层
+            self.layers.append(ActivationLayer(activation_fn))
+            # 添加 Dropout 层
             if dropout_rate > 0:
-                layers.append(nn.Dropout(dropout_rate))
+                self.layers.append(DropoutLayer(dropout_rate))
             input_dim = hidden_units
-        
-        layers.append(nn.Linear(input_dim, 10))
-        self.layers = nn.Sequential(*layers)
+
+        # 添加最后的输出线性层 (没有激活函数，将在损失函数前应用 softmax)
+        self.layers.append(LinearLayer(input_dim, 10))
 
     def forward(self, x):
-        return self.layers(x)
+        """模型的前向传播"""
+        for layer in self.layers:
+            x = layer.forward(x)
+        return x # 返回 logits
 
-# CNN 模型
-class BasicCNN(nn.Module):
-    def __init__(self, conv_filters, dropout_rate=0.0, activation_fn='relu', pool_type='max'):
-        super(BasicCNN, self).__init__()
-        
-        # 获取激活函数
-        activation = get_activation_function(activation_fn)
-        
-        # 选择池化类型
-        if pool_type == 'max':
-            pooling = nn.MaxPool2d(kernel_size=2, stride=2)
-        else:  # 'avg'
-            pooling = nn.AvgPool2d(kernel_size=2, stride=2)
-        
-        self.conv_layers = nn.Sequential(
-            # 第一层卷积
-            nn.Conv2d(in_channels=1, out_channels=conv_filters[0], kernel_size=3, padding=1),
-            activation,
-            pooling,  # 输出: [N, conv_filters[0], 14, 14]
-            
-            # 第二层卷积
-            nn.Conv2d(in_channels=conv_filters[0], out_channels=conv_filters[1], kernel_size=3, padding=1),
-            activation,
-            pooling   # 输出: [N, conv_filters[1], 7, 7]
-        )
-        
-        # 展平后特征的维度
-        self.flatten_dim = conv_filters[1] * 7 * 7
-        
+    def backward(self, grad_output):
+        """模型的反向传播"""
+        # 从最后一层开始反向传播梯度
+        for layer in reversed(self.layers):
+            grad_output = layer.backward(grad_output)
+        return grad_output # 返回相对于模型输入的梯度 (通常不需要)
+
+    def update(self, learning_rate):
+        """更新模型中所有层的参数"""
+        for layer in self.layers:
+            layer.update(learning_rate)
+
+    def set_training_mode(self, is_training):
+        """设置模型及其层的训练/评估模式"""
+        for layer in self.layers:
+            if isinstance(layer, DropoutLayer):
+                layer.set_training_mode(is_training)
+
+
+# --- NumPy 实现的 CNN 模型 ---
+class BasicCNN_NumPy:
+    def __init__(self, conv_filters=(16, 32), kernel_size=3, pool_size=2,
+                 fc_hidden_units=(64,), dropout_rate=0.0, activation_fn='relu'):
+        self.layers = []
+        in_channels = 1 # MNIST 输入通道为 1
+        input_h, input_w = 28, 28 # MNIST 输入尺寸
+
+        # 卷积和池化层
+        for i, out_channels in enumerate(conv_filters):
+            # 卷积层 (使用 valid padding)
+            conv = ConvLayer(in_channels, out_channels, kernel_size, stride=1, padding=0) # 'valid'
+            self.layers.append(conv)
+            # 计算卷积后的尺寸
+            input_h = (input_h - kernel_size) + 1
+            input_w = (input_w - kernel_size) + 1
+
+            # 激活层
+            self.layers.append(ActivationLayer(activation_fn))
+
+            # 池化层
+            pool = PoolingLayer(pool_size)
+            self.layers.append(pool)
+            # 计算池化后的尺寸
+            input_h = (input_h - pool_size) // pool_size + 1
+            input_w = (input_w - pool_size) // pool_size + 1
+
+            in_channels = out_channels # 更新下一层的输入通道
+
+        # 展平层
+        self.layers.append(FlattenLayer())
+        flattened_dim = in_channels * input_h * input_w # 计算展平后的维度
+
         # 全连接层
-        self.fc_layers = nn.Sequential(
-            nn.Linear(self.flatten_dim, 128),
-            activation,
-            nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity(),
-            nn.Linear(128, 10)  # 输出：10 类
-        )
+        input_dim = flattened_dim
+        for i, hidden_units in enumerate(fc_hidden_units):
+            self.layers.append(LinearLayer(input_dim, hidden_units))
+            self.layers.append(ActivationLayer(activation_fn))
+            if dropout_rate > 0:
+                self.layers.append(DropoutLayer(dropout_rate))
+            input_dim = hidden_units
+
+        # 输出层
+        self.layers.append(LinearLayer(input_dim, 10))
 
     def forward(self, x):
-        x = self.conv_layers(x)
-        x = x.view(x.size(0), -1)  # 展平
-        x = self.fc_layers(x)
-        return x
+        """模型的前向传播 (N, 1, 28, 28) -> (N, 10)"""
+        # 确保输入是 4D
+        if x.ndim == 2: # 如果输入是展平的 (e.g., from MLP test)
+            N = x.shape[0]
+            x = x.reshape(N, 1, 28, 28) # 假设是 MNIST
+        elif x.ndim != 4:
+             raise ValueError(f"CNN 输入应为 4D (N, C, H, W)，但得到 {x.ndim}D")
+
+        for layer in self.layers:
+            x = layer.forward(x)
+        return x # 返回 logits
+
+    def backward(self, grad_output):
+        """模型的反向传播"""
+        for layer in reversed(self.layers):
+            grad_output = layer.backward(grad_output)
+        return grad_output
+
+    def update(self, learning_rate):
+        """更新模型中所有层的参数"""
+        for layer in self.layers:
+            layer.update(learning_rate)
+
+    def set_training_mode(self, is_training):
+        """设置模型及其层的训练/评估模式"""
+        for layer in self.layers:
+            if isinstance(layer, DropoutLayer):
+                layer.set_training_mode(is_training)
+
+
+# --- 模型和结构选择 ---
 
 def get_mlp_structure(structure_option='medium'):
-    """
-    获取 MLP 结构配置
-    
-    Args:
-        structure_option: 'small', 'medium', 或 'large'
-        
-    Returns:
-        包含隐藏层神经元数量的列表
-    """
-    structures = {
-        'small': [128],                # 一个隐藏层，128个神经元
-        'medium': [256, 128],          # 两个隐藏层
-        'large': [512, 256, 128]       # 三个隐藏层
-    }
-    return structures.get(structure_option, [256, 128])  # 默认使用 medium 结构
+    structures = {'small': [128], 'medium': [256, 128], 'large': [512, 256, 128]}
+    return structures.get(structure_option, [256, 128])
 
 def get_cnn_structure(structure_option='medium'):
-    """
-    获取 CNN 结构配置
-    
-    Args:
-        structure_option: 'small', 'medium', 或 'large'
-        
-    Returns:
-        包含卷积层滤波器数量的列表
-    """
+    # 返回卷积层的滤波器数量和全连接层的隐藏单元数量
+    # (conv_filters, fc_hidden_units)
     structures = {
-        'small': [16, 32],      # 小型网络
-        'medium': [32, 64],     # 中型网络
-        'large': [64, 128]      # 大型网络
+        'small': ([16], [32]),            # 1 Conv, 1 FC
+        'medium': ([16, 32], [64]),       # 2 Conv, 1 FC
+        'large': ([32, 64, 64], [128, 64]) # 3 Conv, 2 FC
     }
-    return structures.get(structure_option, [32, 64])  # 修正为正确的数值
+    return structures.get(structure_option, ([16, 32], [64]))
 
-def create_model(model_type, structure_option='medium', dropout_rate=0.0, activation_fn='relu', pool_type='max'):
-    """
-    创建指定类型和结构的模型
-    
-    Args:
-        model_type: 'mlp' 或 'cnn'
-        structure_option: 'small', 'medium', 或 'large'
-        dropout_rate: Dropout 比例
-        activation_fn: 激活函数类型
-        pool_type: 池化层类型 ('max' 或 'avg')，仅用于 CNN
-        
-    Returns:
-        创建好的模型实例
-    """
-    if model_type.lower() == 'mlp':
+def create_model(model_type, structure_option='medium', dropout_rate=0.0, activation_fn='relu'):
+    """创建指定类型和结构的模型"""
+    model_type = model_type.lower()
+    if model_type == 'mlp':
         structure = get_mlp_structure(structure_option)
-        return BasicMLP(structure, dropout_rate, activation_fn)
-    elif model_type.lower() == 'cnn':
-        structure = get_cnn_structure(structure_option)
-        return BasicCNN(structure, dropout_rate, activation_fn, pool_type)
+        return BasicMLP_NumPy(structure, dropout_rate, activation_fn)
+    elif model_type == 'cnn':
+        conv_filters, fc_hidden_units = get_cnn_structure(structure_option)
+        # 可以添加更多参数给 CNN，如 kernel_size, pool_size
+        return BasicCNN_NumPy(conv_filters=conv_filters,
+                              fc_hidden_units=fc_hidden_units,
+                              dropout_rate=dropout_rate,
+                              activation_fn=activation_fn)
     else:
         raise ValueError(f"不支持的模型类型: {model_type}")
-    
-def get_activation_function(activation_type='relu'):
-    """
-    获取指定类型的激活函数
-    
-    Args:
-        activation_type: 激活函数类型名称
-        
-    Returns:
-        对应的 PyTorch 激活函数模块
-    """
-    activations = {
-        'relu': nn.ReLU(),
-        'sigmoid': nn.Sigmoid(),
-        'tanh': nn.Tanh(),
-        'leaky_relu': nn.LeakyReLU(0.1),
-        'elu': nn.ELU(),
-    }
-    return activations.get(activation_type.lower(), nn.ReLU())  # 默认返回 ReLU
 
-def get_loss_function(loss_type='cross_entropy', reduction='mean', use_augmented=False):
-    """
-    获取指定类型的损失函数，针对增强数据可以使用加权损失
-    """
-    if use_augmented and loss_type.lower() == 'cross_entropy':
-        # 对于增强数据使用标签平滑技术，减轻过拟合
-        return nn.CrossEntropyLoss(reduction=reduction, label_smoothing=0.1)
-    
-    losses = {
-        'mse': nn.MSELoss(reduction=reduction),
-        'cross_entropy': nn.CrossEntropyLoss(reduction=reduction),
-        'bce': nn.BCELoss(reduction=reduction),
-        'bce_with_logits': nn.BCEWithLogitsLoss(reduction=reduction),
-        'l1': nn.L1Loss(reduction=reduction),
-    }
-    return losses.get(loss_type.lower(), nn.CrossEntropyLoss(reduction=reduction))
+# --- 损失函数和优化器 ---
 
-def get_optimizer(optimizer_type='sgd', model_parameters=None, lr=0.01, momentum=0.9, weight_decay=0.0, betas=(0.9, 0.999)):
-    """
-    获取指定类型的优化器
-    
-    Args:
-        optimizer_type: 优化器类型名称
-        model_parameters: 模型参数
-        lr: 学习率
-        momentum: SGD 动量参数
-        weight_decay: L2 正则化强度
-        betas: Adam系列优化器的 beta 参数
-        
-    Returns:
-        配置好的 PyTorch 优化器
-    """
-    if model_parameters is None:
-        raise ValueError("必须提供模型参数!")
-        
-    optimizers = {
-        'sgd': lambda: torch.optim.SGD(model_parameters, lr=lr, momentum=momentum, weight_decay=weight_decay),
-        'adam': lambda: torch.optim.Adam(model_parameters, lr=lr, betas=betas, weight_decay=weight_decay),
-        'adamw': lambda: torch.optim.AdamW(model_parameters, lr=lr, betas=betas, weight_decay=weight_decay),
-        'rmsprop': lambda: torch.optim.RMSprop(model_parameters, lr=lr, momentum=momentum, weight_decay=weight_decay),
-    }
-    
-    optimizer_fn = optimizers.get(optimizer_type.lower(), optimizers['sgd'])
-    return optimizer_fn()
+def get_loss_function(loss_type='cross_entropy'):
+    if loss_type.lower() == 'cross_entropy':
+        return cross_entropy_loss, cross_entropy_loss_derivative
+    elif loss_type.lower() == 'mse':
+        return mse_loss, mse_loss_derivative
+    else:
+        raise ValueError(f"不支持的损失类型: {loss_type}")
 
-def apply_l1_regularization(model, loss, l1_lambda=0.001):
-    """
-    应用 L1 正则化
-    
-    Args:
-        model: 神经网络模型
-        loss: 当前损失值
-        l1_lambda: L1 正则化强度
-        
-    Returns:
-        添加了 L1 正则项的损失值
-    """
-    l1_norm = sum(p.abs().sum() for p in model.parameters())
-    return loss + l1_lambda * l1_norm
+class SGD_Optimizer:
+    """简单的 SGD 优化器 (NumPy 版本)，支持 MLP 和 CNN"""
+    def __init__(self, model, learning_rate, momentum=0.0):
+        self.model = model
+        self.learning_rate = learning_rate
+        self.momentum = momentum
+        self.velocities = {}
+        self._initialize_velocities()
+
+    def _initialize_velocities(self):
+        """初始化动量速度字典"""
+        self.velocities = {}
+        if self.momentum > 0:
+            for i, layer in enumerate(self.model.layers):
+                if hasattr(layer, 'weights') and hasattr(layer, 'biases'):
+                    # 适用于 LinearLayer 和 ConvLayer
+                    self.velocities[f'w_{i}'] = np.zeros_like(layer.weights)
+                    self.velocities[f'b_{i}'] = np.zeros_like(layer.biases)
+
+    def step(self):
+        """执行一步优化，更新模型参数"""
+        for i, layer in enumerate(self.model.layers):
+            if hasattr(layer, 'weights') and hasattr(layer, 'biases') and \
+               hasattr(layer, 'grad_weights') and hasattr(layer, 'grad_biases') and \
+               layer.grad_weights is not None and layer.grad_biases is not None: # 确保梯度已计算
+
+                if self.momentum > 0:
+                    # 更新速度
+                    self.velocities[f'w_{i}'] = self.momentum * self.velocities[f'w_{i}'] - self.learning_rate * layer.grad_weights
+                    self.velocities[f'b_{i}'] = self.momentum * self.velocities[f'b_{i}'] - self.learning_rate * layer.grad_biases
+                    # 使用速度更新参数
+                    layer.weights += self.velocities[f'w_{i}']
+                    layer.biases += self.velocities[f'b_{i}']
+                else:
+                    # 无动量的 SGD 更新
+                    layer.weights -= self.learning_rate * layer.grad_weights
+                    layer.biases -= self.learning_rate * layer.grad_biases
+            elif isinstance(layer, (ActivationLayer, DropoutLayer, PoolingLayer, FlattenLayer)):
+                 pass # 这些层没有可训练参数
+            # else:
+                 # print(f"警告: 层 {i} ({type(layer)}) 没有更新，可能缺少参数或梯度。")
+
+
+def get_optimizer(optimizer_type='sgd', model=None, lr=0.01, momentum=0.9, weight_decay=0.0):
+    if model is None: raise ValueError("必须提供模型实例!")
+    if weight_decay > 0: print("警告: NumPy 版本的 SGD 优化器暂未实现 weight_decay")
+    optimizer_type = optimizer_type.lower()
+    if optimizer_type == 'sgd':
+        return SGD_Optimizer(model, lr, momentum)
+    elif optimizer_type in ['adam', 'adamw', 'rmsprop']:
+        raise NotImplementedError(f"NumPy 版本的 {optimizer_type} 优化器尚未实现")
+    else:
+        raise ValueError(f"不支持的优化器类型: {optimizer_type}")
 
 def configure_regularization(config):
-    """
-    配置正则化策略
-    
-    Args:
-        config: 包含正则化配置的字典
-        
-    Returns:
-        配置好的正则化选项字典
-    """
-    regularization_config = {
-        'methods': config.get('regularization_methods', ['none']),
-        'dropout_rate': config.get('dropout_rate', 0.0),
-        'l1_lambda': config.get('l1_lambda', 0.0001),
-        'weight_decay': config.get('weight_decay', 0.0001),  # 用于 L2 正则化
-        'early_stopping': config.get('early_stopping', False),
+    methods = config.get('regularization_methods', [])
+    return {
+        'methods': methods,
+        'dropout_rate': config.get('dropout_rate', 0.0) if 'dropout' in methods else 0.0,
+        'early_stopping': 'early_stopping' in methods,
         'patience': config.get('patience', 5),
     }
-    return regularization_config
 
-def load_mnist_data(images_path, labels_path, is_train=True):
-    """
-    加载 MNIST 数据集
-    
-    Args:
-        images_path: 图像数据文件路径
-        labels_path: 标签数据文件路径
-        is_train: 是否为训练集
-        
-    Returns:
-        加载的图像和标签数据
-    """
-    # 加载图像
+# --- 数据加载与处理 ---
+
+def load_mnist_data(images_path, labels_path, model_type='mlp'):
+    """加载 MNIST 数据集 (返回 NumPy 数组)"""
     with gzip.open(images_path, 'rb') as f:
         magic, num_images, rows, cols = struct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num_images, rows, cols)
-    
-    # 加载标签
+        images = np.frombuffer(f.read(), dtype=np.uint8)
+        if model_type == 'cnn':
+            # CNN 需要 (N, C, H, W) 格式， MNIST 是灰度图，C=1
+            images = images.reshape(num_images, 1, rows, cols)
+        else: # MLP 需要展平
+            images = images.reshape(num_images, rows * cols)
+        images = images.astype(np.float32) / 255.0 # 归一化
+
     with gzip.open(labels_path, 'rb') as f:
         magic, num_labels = struct.unpack(">II", f.read(8))
         labels = np.frombuffer(f.read(), dtype=np.uint8)
-    
-    return images, labels
 
-def load_augmented_data(images_path, labels_path):
-    """
-    加载预处理的增强数据集（由 train_set_adjust.py 生成）
-    
-    Args:
-        images_path: 增强后图像数据文件路径
-        labels_path: 增强后标签数据文件路径
-        
-    Returns:
-        加载的增强图像和标签数据
-    """
-    # 加载 npy.gz 格式的增强数据
-    with gzip.open(images_path, 'rb') as f:
-        images = np.load(f)
-    
-    with gzip.open(labels_path, 'rb') as f:
-        labels = np.load(f)
-    
     return images, labels
-
-def apply_real_time_augmentation(dataset_type='mlp'):
-    """
-    配置实时数据增强管道
-    
-    Args:
-        dataset_type: 'mlp' 或 'cnn' (影响是否保留通道维度)
-        
-    Returns:
-        对应的 transforms 对象
-    """
-    if dataset_type == 'mlp':
-        # MLP 需要展平为 1D
-        transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.view(-1))  # 展平为 1D
-        ])
-    else:  # CNN
-        # CNN 保留 2D 结构
-        transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.ToTensor(),
-        ])
-    
-    return transform
 
 def prepare_data_loaders(config):
-    """根据配置准备数据加载器"""
-    use_augmented = config.get('use_augmented_data', False)
+    """根据配置准备数据"""
     model_type = config.get('model_type', 'mlp').lower()
     batch_size = config.get('batch_size', 64)
-    use_one_hot = config.get('use_one_hot', False)
-    
-    # 数据路径
-    data_dir = config.get('data_dir', '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST')
-    
-    # 不管是否启用增强，都使用原始数据
-    train_images_path = f"{data_dir}/train-images-idx3-ubyte.gz"
-    train_labels_path = f"{data_dir}/train-labels-idx1-ubyte.gz"
-    train_images, train_labels = load_mnist_data(train_images_path, train_labels_path)
-    
-    # 测试数据
-    test_images_path = f"{data_dir}/t10k-images-idx3-ubyte.gz"
-    test_labels_path = f"{data_dir}/t10k-labels-idx1-ubyte.gz"
-    test_images, test_labels = load_mnist_data(test_images_path, test_labels_path, is_train=False)
-    
-    # 转换为PyTorch张量
-    train_images = torch.tensor(train_images, dtype=torch.float32) / 255.0
-    test_images = torch.tensor(test_images, dtype=torch.float32) / 255.0
-    train_labels = torch.tensor(train_labels, dtype=torch.long)
-    test_labels = torch.tensor(test_labels, dtype=torch.long)
-    
-    # 根据模型类型调整数据形状
-    if model_type == 'mlp':
-        train_images = train_images.view(-1, 28 * 28)
-        test_images = test_images.view(-1, 28 * 28)
-    else:  # CNN
-        train_images = train_images.unsqueeze(1)  # 添加通道维度 [N, 1, 28, 28]
-        test_images = test_images.unsqueeze(1)
-    
-    # 如果启用增强，使用自定义数据集实现实时增强
-    if use_augmented and model_type == 'cnn':  # 仅为CNN模型启用增强
-        train_dataset = MNISTAugmentDataset(train_images, train_labels)
+    loss_type = config.get('loss_type', 'cross_entropy').lower()
+    use_one_hot = loss_type == 'mse'
+    data_dir = config.get('data_dir', './mnist_data') # 默认当前目录下的 mnist_data
+
+    # 加载数据，根据模型类型确定形状
+    try:
+        train_images_path = os.path.join(data_dir, "train-images-idx3-ubyte.gz")
+        train_labels_path = os.path.join(data_dir, "train-labels-idx1-ubyte.gz")
+        train_images, train_labels = load_mnist_data(train_images_path, train_labels_path, model_type)
+
+        test_images_path = os.path.join(data_dir, "t10k-images-idx3-ubyte.gz")
+        test_labels_path = os.path.join(data_dir, "t10k-labels-idx1-ubyte.gz")
+        test_images, test_labels = load_mnist_data(test_images_path, test_labels_path, model_type)
+    except FileNotFoundError as e:
+         print(f"错误：找不到 MNIST 数据文件。请确保路径 '{data_dir}' 正确并包含以下文件：")
+         print("- train-images-idx3-ubyte.gz, train-labels-idx1-ubyte.gz")
+         print("- t10k-images-idx3-ubyte.gz, t10k-labels-idx1-ubyte.gz")
+         raise e
+
+    # 如果使用 MSE，标签转换为 one-hot
+    if use_one_hot:
+        num_classes = 10
+        train_labels = one_hot_encode(train_labels, num_classes)
+        test_labels = one_hot_encode(test_labels, num_classes)
+
+    # 准备加载器信息字典
+    def create_loader_info(images, labels, shuffle):
+        num_samples = images.shape[0]
+        return {
+            'images': images,
+            'labels': labels,
+            'batch_size': batch_size,
+            'num_samples': num_samples,
+            'num_batches': int(np.ceil(num_samples / batch_size)),
+            'shuffle': shuffle,
+            'use_one_hot': use_one_hot,
+            'num_classes': 10 # MNIST specific
+        }
+
+    train_loader_info = create_loader_info(train_images, train_labels, True)
+    test_loader_info = create_loader_info(test_images, test_labels, False)
+
+    return train_loader_info, test_loader_info
+
+def get_batch(loader_info, batch_index, indices=None):
+    """从数据信息中获取一个批次"""
+    start = batch_index * loader_info['batch_size']
+    end = min(start + loader_info['batch_size'], loader_info['num_samples']) # 处理最后一个批次
+
+    if indices is not None:
+        batch_indices = indices[start:end]
+        images = loader_info['images'][batch_indices]
+        labels = loader_info['labels'][batch_indices]
     else:
-        # 使用常规数据集
-        train_dataset = torch.utils.data.TensorDataset(train_images, train_labels)
-    
-    test_dataset = torch.utils.data.TensorDataset(test_images, test_labels)
-    
-    # 创建数据加载器
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, test_loader
+        images = loader_info['images'][start:end]
+        labels = loader_info['labels'][start:end]
 
-# 添加一个新的自定义数据集类用于实时增强
-class MNISTAugmentDataset(torch.utils.data.Dataset):
-    def __init__(self, images, labels):
-        self.images = images
-        self.labels = labels
-        # 仅使用非常轻微的增强
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomAffine(
-                degrees=5,          # 最大旋转5度
-                translate=(0.05, 0.05),  # 最大平移5%
-                scale=(0.95, 1.05)       # 最大缩放5%
-            ),
-            transforms.ToTensor(),
-        ])
-    
-    def __len__(self):
-        return len(self.images)
-    
-    def __getitem__(self, idx):
-        image = self.images[idx]
-        label = self.labels[idx]
-        
-        # 50%概率应用增强
-        if torch.rand(1).item() < 0.5:
-            # 从[C,H,W]转为[H,W,C]再转回来
-            image = self.transform(image.squeeze(0))  # 返回的是[C,H,W]形式的张量
-        
-        return image, label
+    return images, labels
 
-def train_model(model, train_loader, val_loader=None, config=None, progress_callback=None):
-    """
-    训练神经网络模型
-    
-    Args:
-        model: 神经网络模型
-        train_loader: 训练数据加载器
-        val_loader: 验证数据加载器 (可选，用于早停)
-        config: 训练配置
-        progress_callback: 进度回调函数
-        
-    Returns:
-        训练后的模型和训练历史记录
-    """
-    if config is None:
-        config = {}
-    
-    # 提取训练参数
-    device = config.get('device', torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+# --- 训练与测试 (NumPy 版本) ---
+
+def train_model(model, train_loader_info, val_loader_info=None, config=None, progress_callback=None):
+    """训练 NumPy 模型 (MLP 或 CNN)"""
+    if config is None: config = {}
+
     num_epochs = config.get('num_epochs', 10)
     loss_type = config.get('loss_type', 'cross_entropy')
     optimizer_type = config.get('optimizer_type', 'sgd')
     lr = config.get('learning_rate', 0.01)
-    momentum = config.get('momentum', 0.9)
-    weight_decay = config.get('weight_decay', 0.0)
-    
-    # 获取损失函数和优化器
-    criterion = get_loss_function(loss_type)
-    optimizer = get_optimizer(optimizer_type, model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-    
-    # 训练历史记录
-    history = {
-        'train_loss': [],
-        'val_loss': [] if val_loader else None
-    }
-    
-    # 训练循环
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        
-        # 计算进度并每10%调用一次回调
-        current_progress = int((epoch / num_epochs) * 100)
-        if progress_callback and (current_progress % 10 == 0 or epoch == num_epochs - 1):
-            progress_callback(epoch, num_epochs)
-        
-        for i, (images, labels) in enumerate(train_loader):
-            images, labels = images.to(device), labels.to(device)
-            
-            # 前向传播
-            outputs = model(images)
+    momentum = config.get('momentum', 0.0) # 默认 0
+    regularization_config = configure_regularization(config)
 
-            # --- 添加的修复逻辑 ---
-            if loss_type == 'mse':
-                # 检查标签是否已经是 one-hot (理论上不应该，但以防万一)
-                if len(labels.shape) == 1:
-                    try:
-                        # 将类别索引转换为 one-hot 编码
-                        # 需要知道类别数量，对于MNIST是10
-                        num_classes = outputs.shape[1] # 从模型输出获取类别数更通用
-                        labels_one_hot = torch.nn.functional.one_hot(labels, num_classes=num_classes).float()
-                        labels_to_use = labels_one_hot
-                    except Exception as e_onehot:
-                        print(f"警告：将标签转换为 one-hot 时出错: {e_onehot}。标签形状: {labels.shape}")
-                        labels_to_use = labels # 出错则使用原始标签，可能导致后续维度错误
-                else:
-                    labels_to_use = labels.float() # 确保数据类型是 float
-            else:
-                labels_to_use = labels # 对于非 MSE 损失，使用原始标签
-            # --- 修复逻辑结束 ---
-            
-            # 计算损失 (使用转换后的标签)
-            loss = criterion(outputs, labels_to_use)
-            
-            # 反向传播
-            optimizer.zero_grad()
-            loss.backward()
+    loss_fn, loss_derivative_fn = get_loss_function(loss_type)
+    optimizer = get_optimizer(optimizer_type, model, lr, momentum)
+
+    history = {'train_loss': [], 'val_loss': [] if val_loader_info else None}
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+
+    for epoch in range(num_epochs):
+        model.set_training_mode(True)
+        running_loss = 0.0
+
+        indices = np.arange(train_loader_info['num_samples'])
+        if train_loader_info['shuffle']:
+            np.random.shuffle(indices)
+
+        if progress_callback: progress_callback(epoch, num_epochs)
+
+        for i in range(train_loader_info['num_batches']):
+            batch_images, batch_labels = get_batch(train_loader_info, i, indices)
+
+            logits = model.forward(batch_images)
+
+            if loss_type == 'cross_entropy':
+                probs = softmax(logits)
+                loss = loss_fn(probs, batch_labels) # labels 是索引
+                grad_loss = loss_derivative_fn(probs, batch_labels)
+            elif loss_type == 'mse':
+                loss = loss_fn(logits, batch_labels) # labels 是 one-hot
+                grad_loss = loss_derivative_fn(logits, batch_labels)
+            else: raise ValueError("不支持的损失类型")
+
+            running_loss += loss
+
+            model.backward(grad_loss)
             optimizer.step()
-            
-            running_loss += loss.item()
-            
-            # 每 100 批次打印一次
-            if (i + 1) % 100 == 0:
-                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {running_loss/100:.4f}')
-                running_loss = 0.0
-        
-        # 记录训练损失
-        if len(train_loader) > 0:
-            epoch_loss = running_loss / len(train_loader)
-            history['train_loss'].append(epoch_loss)
-        
-        # 验证 (用于早停)
-        if val_loader:
-            model.eval()
+
+        epoch_loss = running_loss / train_loader_info['num_batches']
+        history['train_loss'].append(epoch_loss)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Training Loss: {epoch_loss:.4f}')
+
+        # --- 验证 ---
+        if val_loader_info:
+            model.set_training_mode(False)
             val_loss = 0.0
-            with torch.no_grad():
-                for images, labels in val_loader:
-                    images, labels = images.to(device), labels.to(device)
-                    outputs = model(images)
-                    batch_loss = criterion(outputs, labels).item()
-                    val_loss += batch_loss
-            
-            val_loss /= len(val_loader)
-            history['val_loss'].append(val_loss)
-            print(f'Validation Loss: {val_loss:.4f}')
-    
+            for i in range(val_loader_info['num_batches']):
+                val_images, val_labels = get_batch(val_loader_info, i)
+                val_logits = model.forward(val_images)
+
+                if loss_type == 'cross_entropy':
+                    val_probs = softmax(val_logits)
+                    batch_val_loss = loss_fn(val_probs, val_labels)
+                elif loss_type == 'mse':
+                    batch_val_loss = loss_fn(val_logits, val_labels)
+                val_loss += batch_val_loss
+
+            epoch_val_loss = val_loss / val_loader_info['num_batches']
+            history['val_loss'].append(epoch_val_loss)
+            print(f'Epoch [{epoch+1}/{num_epochs}], Validation Loss: {epoch_val_loss:.4f}')
+
+            # 早停逻辑
+            if regularization_config['early_stopping']:
+                if epoch_val_loss < best_val_loss:
+                    best_val_loss = epoch_val_loss
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= regularization_config['patience']:
+                        print(f"早停触发!")
+                        break
+
+    model.set_training_mode(False)
     return model, history
 
-def test_model(model, test_loader, device=None):
-    """
-    测试神经网络模型
-    
-    Args:
-        model: 神经网络模型
-        test_loader: 测试数据加载器
-        device: 运行设备
-        
-    Returns:
-        测试准确率
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = model.to(device)
-    model.eval()
-    
+
+def test_model(model, test_loader_info, loss_type='cross_entropy'):
+    """测试 NumPy 模型 (MLP 或 CNN)"""
+    model.set_training_mode(False)
     correct = 0
     total = 0
-    
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            
-            # 如果标签是 one-hot 编码，转换回类索引
-            if len(labels.shape) > 1 and labels.shape[1] > 1:
-                _, labels = torch.max(labels, 1)
-            
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    
+
+    for i in range(test_loader_info['num_batches']):
+        images, labels_true = get_batch(test_loader_info, i) # 获取原始标签 (索引或 one-hot)
+
+        logits = model.forward(images)
+        predicted_indices = np.argmax(logits, axis=1)
+
+        if test_loader_info['use_one_hot']: # 如果标签是 one-hot
+            true_indices = np.argmax(labels_true, axis=1)
+        else: # 标签是索引
+            true_indices = labels_true
+
+        total += true_indices.shape[0]
+        correct += np.sum(predicted_indices == true_indices)
+
     accuracy = 100 * correct / total
     print(f'Test Accuracy: {accuracy:.2f}%')
-    
     return accuracy
 
+
+# --- K 折交叉验证 (基于 NumPy) ---
 def run_k_fold_validation(config, k=5):
-    """
-    执行 k 折交叉验证
-    
-    Args:
-        config: 训练配置
-        k: 折数
-        
-    Returns:
-        平均验证准确率和折级别结果
-    """
+    """执行 k 折交叉验证 (NumPy 版本, 支持 MLP 和 CNN)"""
     model_type = config.get('model_type', 'mlp')
     structure_option = config.get('structure_option', 'medium')
     activation_fn = config.get('activation_fn', 'relu')
-    pool_type = config.get('pool_type', 'max')
-    dropout_rate = config.get('dropout_rate', 0.0)
-    
-    # 加载数据
-    train_loader, _ = prepare_data_loaders(config)
-    train_dataset = train_loader.dataset
-    
-    # 设置交叉验证
+    regularization_config = configure_regularization(config)
+    dropout_rate = regularization_config.get('dropout_rate', 0.0)
+    loss_type = config.get('loss_type', 'cross_entropy')
+    use_one_hot = loss_type == 'mse'
+
+    # 加载完整训练数据
+    temp_config = config.copy()
+    temp_config['batch_size'] = 1 # 加载所有数据，后面再分批
+    full_loader_info, _ = prepare_data_loaders(temp_config) # 获取原始形状的数据
+    all_train_images = full_loader_info['images']
+    all_train_labels = full_loader_info['labels'] # 可能是索引或 one-hot
+    n_samples = full_loader_info['num_samples']
+    batch_size = config.get('batch_size', 64) # 恢复原始 batch_size
+
     kf = KFold(n_splits=k, shuffle=True, random_state=42)
     fold_accuracies = []
-    
-    # 遍历每一折
-    for fold, (train_idx, val_idx) in enumerate(kf.split(range(len(train_dataset)))):
-        print(f'Fold {fold+1}/{k}')
-        
-        # 为当前折创建数据加载器
-        train_subset = torch.utils.data.Subset(train_dataset, train_idx)
-        val_subset = torch.utils.data.Subset(train_dataset, val_idx)
-        
-        batch_size = config.get('batch_size', 64)
-        train_loader_fold = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
-        val_loader_fold = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-        
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(n_samples))):
+        print(f'\n--- Fold {fold+1}/{k} ---')
+
+        # 创建当前折的数据加载器信息
+        fold_train_loader_info = {
+            'images': all_train_images[train_idx],
+            'labels': all_train_labels[train_idx],
+            'batch_size': batch_size,
+            'num_samples': len(train_idx),
+            'num_batches': int(np.ceil(len(train_idx) / batch_size)),
+            'shuffle': True,
+            'use_one_hot': use_one_hot,
+            'num_classes': 10
+        }
+        fold_val_loader_info = {
+            'images': all_train_images[val_idx],
+            'labels': all_train_labels[val_idx],
+            'batch_size': batch_size,
+            'num_samples': len(val_idx),
+            'num_batches': int(np.ceil(len(val_idx) / batch_size)),
+            'shuffle': False,
+            'use_one_hot': use_one_hot,
+            'num_classes': 10
+        }
+
         # 创建新模型
-        model = create_model(model_type, structure_option, dropout_rate, activation_fn, pool_type)
-        
+        model = create_model(model_type, structure_option, dropout_rate, activation_fn)
+
         # 训练模型
-        fold_config = config.copy()
-        model, _ = train_model(model, train_loader_fold, val_loader_fold, fold_config)
-        
-        # 验证模型
-        accuracy = test_model(model, val_loader_fold, config.get('device'))
+        fold_config = config.copy() # 传递完整的配置
+        model, _ = train_model(model, fold_train_loader_info, fold_val_loader_info, fold_config)
+
+        # 在验证集上测试
+        accuracy = test_model(model, fold_val_loader_info, loss_type=loss_type)
         fold_accuracies.append(accuracy)
         print(f'Fold {fold+1} Validation Accuracy: {accuracy:.2f}%')
-    
-    # 计算平均准确率
-    avg_accuracy = sum(fold_accuracies) / len(fold_accuracies)
-    print(f'Average Validation Accuracy: {avg_accuracy:.2f}%')
-    
+
+    avg_accuracy = np.mean(fold_accuracies)
+    print(f'\nAverage K-Fold Validation Accuracy ({k} folds): {avg_accuracy:.2f}%')
     return avg_accuracy, fold_accuracies
 
-def objective_function(config):
-    """
-    优化目标函数 - 用于贝叶斯优化
-    
-    Args:
-        config: 包含超参数的配置字典
-        
-    Returns:
-        验证准确率 (用于优化)
-    """
-    # 提取超参数
-    learning_rate = config.get('learning_rate', 0.01)
-    num_epochs = int(config.get('num_epochs', 10))
-    batch_size = int(config.get('batch_size', 64))
-    k_folds = int(config.get('k_folds', 5))
-    model_type = config.get('model_type', 'mlp')
-    
-    if model_type == 'mlp':
-        structure_index = int(config.get('structure_index', 1))
-        structure_options = ['small', 'medium', 'large']
-        structure_option = structure_options[structure_index]
-    else:  # CNN
-        structure_index = int(config.get('structure_index', 1))
-        structure_options = ['small', 'medium', 'large']
-        structure_option = structure_options[structure_index]
-    
-    # 创建用于交叉验证的配置
-    cv_config = {
-        'model_type': model_type,
+
+# --- 贝叶斯优化和正则化比较 (占位符) ---
+# 这些函数需要外部库 (bayes_opt) 并且逻辑复杂，暂不详细实现 NumPy 版本
+def objective_function(learning_rate, momentum, dropout_rate_config, structure_option_idx, activation_fn_idx):
+    """优化目标函数 - 用于贝叶斯优化 (需要调用 NumPy 版本的 k-fold)"""
+    print("\nRunning Bayesian Optimization Trial...")
+    # --- 将浮点参数映射回选项 ---
+    structure_options = ['small', 'medium', 'large']
+    activation_options = ['relu', 'sigmoid', 'tanh', 'leaky_relu']
+    structure_option = structure_options[min(int(structure_option_idx), len(structure_options)-1)]
+    activation_fn = activation_options[min(int(activation_fn_idx), len(activation_options)-1)]
+    # Dropout 需要根据传入的配置值决定是否启用
+    use_dropout = dropout_rate_config > 0.05 # 假设大于 0.05 才启用
+    dropout_rate = dropout_rate_config if use_dropout else 0.0
+    reg_methods = ['dropout'] if use_dropout else []
+
+    # --- 构建 NumPy 兼容配置 ---
+    # (假设 base_config 包含了 model_type, data_dir, num_epochs, batch_size 等固定参数)
+    global base_config_for_bayesopt # 需要一个全局或闭包变量来传递固定配置
+    if base_config_for_bayesopt is None:
+         raise ValueError("需要设置 base_config_for_bayesopt")
+
+    cv_config = base_config_for_bayesopt.copy()
+    cv_config.update({
+        'learning_rate': float(learning_rate),
+        'momentum': float(momentum),
         'structure_option': structure_option,
-        'activation_fn': config.get('activation_fn', 'relu'),
-        'learning_rate': learning_rate,
-        'num_epochs': num_epochs,
-        'batch_size': batch_size,
-        'optimizer_type': config.get('optimizer_type', 'sgd'),
-        'momentum': config.get('momentum', 0.9),
-        'dropout_rate': config.get('dropout_rate', 0.0),
-        'regularization_config': {
-            'methods': config.get('regularization_methods', ['none']),
-            'l1_lambda': config.get('l1_lambda', 0.0001),
-            'weight_decay': config.get('weight_decay', 0.0001),
-            'patience': config.get('patience', 5)
-        },
-        'device': config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'),
-        'use_augmented_data': config.get('use_augmented_data', False),
-        'data_dir': config.get('data_dir', '/path/to/data')
-    }
-    
-    # 运行交叉验证
-    avg_accuracy, _ = run_k_fold_validation(cv_config, k=k_folds)
-    
-    return avg_accuracy
+        'activation_fn': activation_fn,
+        'regularization_methods': reg_methods,
+        'dropout_rate': dropout_rate,
+        'early_stopping': False, # 优化时不启用早停，以获得完整轮数的表现
+    })
+    # K-Fold 会自行处理 loss_type 和 one-hot
+    print(f"Testing config: LR={cv_config['learning_rate']:.4f}, Momentum={cv_config['momentum']:.3f}, Structure={structure_option}, Activation={activation_fn}, Dropout={dropout_rate:.3f}")
+
+    try:
+        # 调用 NumPy 版本的 k-fold
+        avg_accuracy, _ = run_k_fold_validation(cv_config, k=3) # 使用 3 折加速优化
+        print(f"Trial result (Avg Accuracy): {avg_accuracy:.2f}%")
+        return avg_accuracy # 贝叶斯优化需要最大化目标
+    except Exception as e:
+         print(f"错误发生在 K-Fold 验证中: {e}")
+         return 0.0 # 返回一个低值表示失败
+
+# 全局变量用于传递基础配置给目标函数
+base_config_for_bayesopt = None
 
 def run_bayesian_optimization(config, init_points=5, n_iter=10):
-    """
-    运行贝叶斯优化寻找最佳超参数
-    
-    Args:
-        config: 包含搜索边界和基本配置的字典
-        init_points: 初始随机点数量
-        n_iter: 迭代次数
-        
-    Returns:
-        最佳超参数和对应的性能
-    """
-    # 提取搜索边界
-    pbounds = config.get('pbounds', {
-        'learning_rate': (0.001, 0.1),
-        'num_epochs': (5, 15),
-        'batch_size': (16, 128),
-        'k_folds': (3, 5),
-        'structure_index': (0, 2),  # 小型、中型或大型结构
-        'momentum': (0.5, 0.99),
-        'dropout_rate': (0.0, 0.5),
-        'l1_lambda': (0.0001, 0.01),
-        'weight_decay': (0.0001, 0.01)
-    })
-    
-    # 创建优化器并设置基本配置
-    base_config = {k: v for k, v in config.items() if k != 'pbounds'}
-    
-    def wrapped_objective(**params):
-        """将参数合并到基本配置中，然后调用目标函数"""
-        combined_config = base_config.copy()
-        combined_config.update(params)
-        return objective_function(combined_config)
-    
+    """运行贝叶斯优化 (NumPy 版本)"""
+    global base_config_for_bayesopt
+    base_config_for_bayesopt = config.copy() # 存储基础配置
+
+    try:
+        from bayes_opt import BayesianOptimization
+    except ImportError:
+        print("错误: 需要安装 bayesian-optimization 库才能运行贝叶斯优化。")
+        print("请运行: pip install bayesian-optimization")
+        return None
+
+    # 定义超参数搜索空间
+    pbounds = {
+        'learning_rate': (1e-4, 1e-1),     # 学习率范围
+        'momentum': (0.0, 0.99),           # 动量范围
+        'dropout_rate_config': (0.0, 0.7), # Dropout 比率 (0-0.05 表示禁用)
+        'structure_option_idx': (0, 2.99), # 对应 small, medium, large
+        'activation_fn_idx': (0, 3.99)     # 对应 relu, sigmoid, tanh, leaky_relu
+    }
+
     optimizer = BayesianOptimization(
-        f=wrapped_objective,
+        f=objective_function, # 使用适配后的 NumPy 目标函数
         pbounds=pbounds,
-        random_state=42
+        random_state=42,
+        verbose=2 # verbose = 2 prints details, = 1 prints only when a maximum is observed, = 0 is silent
     )
-    
+
+    print("\n开始贝叶斯优化...")
     # 运行优化
-    print("Starting Bayesian Optimization...")
-    optimizer.maximize(init_points=init_points, n_iter=n_iter)
-    
-    # 返回结果
-    best_params = optimizer.max
-    print("\n=== Best Hyperparameters ===")
-    print(f"Best Average Validation Accuracy: {best_params['target']:.2f}%")
-    print(f"Best Parameters: {best_params['params']}")
-    
-    return best_params
+    # acq='ei', xi=0.01 稍微增加探索性
+    optimizer.maximize(
+        init_points=init_points, # 初始随机点数
+        n_iter=n_iter,           # 迭代次数
+        acq='ei',                # 采集函数 (Expected Improvement)
+        xi=0.01                  # EI 的探索-利用权衡参数
+    )
+
+    print("\n贝叶斯优化完成。")
+    print("最佳参数:")
+    best_params_raw = optimizer.max['params']
+    print(best_params_raw)
+
+    # --- 将优化结果转换回可用的配置格式 ---
+    best_config = base_config_for_bayesopt.copy()
+    structure_options = ['small', 'medium', 'large']
+    activation_options = ['relu', 'sigmoid', 'tanh', 'leaky_relu']
+    structure_idx = min(int(best_params_raw['structure_option_idx']), len(structure_options)-1)
+    activation_idx = min(int(best_params_raw['activation_fn_idx']), len(activation_options)-1)
+    dropout_rate_config = best_params_raw['dropout_rate_config']
+    use_dropout = dropout_rate_config > 0.05
+    dropout_rate = dropout_rate_config if use_dropout else 0.0
+    reg_methods = ['dropout'] if use_dropout else []
+
+    best_config.update({
+        'learning_rate': best_params_raw['learning_rate'],
+        'momentum': best_params_raw['momentum'],
+        'structure_option': structure_options[structure_idx],
+        'activation_fn': activation_options[activation_idx],
+        'regularization_methods': reg_methods,
+        'dropout_rate': dropout_rate,
+    })
+    print("\n转换后的最佳配置:")
+    print(best_config)
+
+    # 清理全局变量
+    base_config_for_bayesopt = None
+    return best_config
 
 def compare_regularization_methods(best_params, config):
-    """
-    使用最佳超参数比较不同的正则化方法
-    
-    Args:
-        best_params: 贝叶斯优化找到的最佳超参数
-        config: 基本配置
-        
-    Returns:
-        不同正则化方法的性能比较表
-    """
-    # 结合最佳超参数和基本配置
-    combined_config = config.copy()
-    for key, value in best_params['params'].items():
-        # 根据需要转换值的类型
-        if key in ['num_epochs', 'batch_size', 'k_folds', 'structure_index']:
-            combined_config[key] = int(value)
-        else:
-            combined_config[key] = value
-    
-    # 确定要比较的正则化方法
-    regularization_methods = ['none', 'l1', 'l2', 'dropout', 'early_stopping']
-    results = {}
-    
-    # 加载数据
-    train_loader, test_loader = prepare_data_loaders(combined_config)
-    
-    # 一个接一个地比较每种正则化方法
-    for method in regularization_methods:
-        print(f"\nRunning with {method} regularization")
-        
-        # 创建一个独立的模型
-        structure_options = ['small', 'medium', 'large']
-        structure_option = structure_options[int(combined_config.get('structure_index', 1))]
-        
-        model = create_model(
-            combined_config['model_type'],
-            structure_option,
-            dropout_rate=combined_config['dropout_rate'] if method == 'dropout' else 0.0,
-            activation_fn=combined_config.get('activation_fn', 'relu')
-        )
-        
-        # 配置特定的正则化方法
-        reg_config = combined_config.copy()
-        reg_config['regularization_config'] = {
-            'methods': [method] if method != 'none' else [],
-            'l1_lambda': combined_config.get('l1_lambda', 0.0001),
-            'weight_decay': combined_config.get('weight_decay', 0.0001),
-            'patience': combined_config.get('patience', 5)
-        }
-        
-        # 训练模型
-        model, _ = train_model(model, train_loader, train_loader, reg_config)  # 使用训练集作为验证集以简化
-        
-        # 测试模型
-        accuracy = test_model(model, test_loader, combined_config.get('device'))
-        results[method] = accuracy
-    
-    # 创建结果表
-    df = pd.DataFrame(list(results.items()), columns=['Regularization', 'Test Accuracy (%)'])
-    print("\n=== Final Results Table ===")
-    print(df)
-    
-    return df
+    """比较正则化方法 (NumPy 版本)"""
+    print("\n--- 开始比较正则化方法 ---")
+    base_config = config.copy()
+    base_config.update(best_params) # 使用找到的最佳超参数
 
+    results = {}
+
+    # 1. 无正则化
+    print("\n测试: 无正则化")
+    config_no_reg = base_config.copy()
+    config_no_reg['regularization_methods'] = []
+    config_no_reg['dropout_rate'] = 0.0
+    config_no_reg['regularization_config'] = configure_regularization(config_no_reg)
+    train_loader, test_loader = prepare_data_loaders(config_no_reg)
+    model_no_reg = create_model(config_no_reg['model_type'], config_no_reg['structure_option'],
+                                config_no_reg['dropout_rate'], config_no_reg['activation_fn'])
+    model_no_reg, _ = train_model(model_no_reg, train_loader, None, config_no_reg)
+    acc_no_reg = test_model(model_no_reg, test_loader, loss_type=config_no_reg['loss_type'])
+    results['无正则化'] = acc_no_reg
+
+    # 2. Dropout
+    print("\n测试: Dropout")
+    config_dropout = base_config.copy()
+    config_dropout['regularization_methods'] = ['dropout']
+    # 使用优化找到的 dropout rate，如果原本是 0，则用一个默认值如 0.3
+    if config_dropout.get('dropout_rate', 0) <= 0.05:
+        config_dropout['dropout_rate'] = 0.3
+        print("警告: 优化得到的 dropout rate 较低，使用默认值 0.3 进行比较")
+    config_dropout['regularization_config'] = configure_regularization(config_dropout)
+    train_loader, test_loader = prepare_data_loaders(config_dropout) # 需要重新加载，因为 dropout 配置变了
+    model_dropout = create_model(config_dropout['model_type'], config_dropout['structure_option'],
+                                 config_dropout['dropout_rate'], config_dropout['activation_fn'])
+    model_dropout, _ = train_model(model_dropout, train_loader, None, config_dropout)
+    acc_dropout = test_model(model_dropout, test_loader, loss_type=config_dropout['loss_type'])
+    results['Dropout'] = acc_dropout
+
+    # 3. 早停 (需要 K-Fold 或单独的验证集) - 这里简化，直接训练然后测试
+    # 注意：没有 K-Fold 的早停效果可能不佳，且需要 patience 参数
+    # print("\n测试: 早停 (简化)")
+    # config_early_stop = base_config.copy()
+    # config_early_stop['regularization_methods'] = ['early_stopping']
+    # config_early_stop['patience'] = 5 # 使用默认耐心值
+    # config_early_stop['regularization_config'] = configure_regularization(config_early_stop)
+    # # 早停需要在 train_model 时传入验证集，这里为了简化比较，不单独划分验证集
+    # # 因此，这个比较可能不太公平或准确
+    # train_loader, test_loader = prepare_data_loaders(config_early_stop)
+    # model_early_stop = create_model(config_early_stop['model_type'], config_early_stop['structure_option'],
+    #                               config_early_stop.get('dropout_rate', 0.0), config_early_stop['activation_fn'])
+    # print("警告: 早停比较未使用独立的验证集，结果可能不准确。")
+    # model_early_stop, _ = train_model(model_early_stop, train_loader, None, config_early_stop) # 传入 None 验证集
+    # acc_early_stop = test_model(model_early_stop, test_loader, loss_type=config_early_stop['loss_type'])
+    # results['早停 (简化)'] = acc_early_stop
+    print("\n早停比较需要独立的验证集或 K-Fold 设置，此处跳过。")
+
+    print("\n--- 正则化方法比较结果 ---")
+    for method, acc in results.items():
+        print(f"{method}: {acc:.2f}%")
+
+    return results
+
+
+# --- 主函数和用户交互 ---
 def main():
-    """
-    主函数
-    """
-    print("====== 神经网络训练配置 ======")
-    
-    # 步骤 1：选择模型类型
-    model_types = ['MLP', 'CNN']
-    model_type = get_user_choice("选择模型类型:", model_types).lower()
-    
-    # 步骤 2：选择是否使用增强数据
-    use_augmentation = get_user_choice("使用增强训练数据?", ['是', '否'])
-    use_augmented_data = (use_augmentation == '是')
-    
-    # 步骤 3：选择运行模式
-    run_modes = ['使用推荐配置运行', '使用贝叶斯优化寻找最佳配置', '手动配置']
+    print("\n====== 神经网络训练配置 (NumPy 版本) ======")
+
+    # --- 获取用户选择 ---
+    model_options = ['mlp', 'cnn']
+    model_type = get_user_choice("选择模型类型:", model_options)
+
+    # run_modes = ['使用推荐配置运行', '手动配置', '使用贝叶斯优化寻找最佳配置', '比较正则化方法']
+    run_modes = ['使用推荐配置运行', '手动配置', '使用贝叶斯优化寻找最佳配置'] # 暂时移除正则化比较入口
     run_mode = get_user_choice("选择运行模式:", run_modes)
-    
-    # 创建基本配置
+
+    # --- 创建基本配置 ---
     config = {
         'model_type': model_type,
-        'use_augmented_data': use_augmented_data,
-        'data_dir': '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST',
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'data_dir': './mnist_data', # 默认数据目录
+        'device': 'cpu', # NumPy 只能用 CPU
     }
-    
-    # 根据运行模式填充配置
+    config['data_dir'] = get_user_input_path("输入 MNIST 数据集目录:", config['data_dir'])
+
+    # --- 根据运行模式填充或获取配置 ---
+    best_params = None # 用于存储贝叶斯优化结果
+
     if run_mode == '使用推荐配置运行':
-        # 填充推荐配置
         if model_type == 'mlp':
             config.update({
-                'structure_option': 'medium',  # [256, 128]
-                'activation_fn': 'sigmoid',
-                'loss_type': 'cross_entropy',
-                'optimizer_type': 'sgd',
-                'learning_rate': 0.01,
-                'momentum': 0.9,
-                'num_epochs': 10,
-                'batch_size': 64,
-                'regularization_config': {
-                    'methods': ['dropout', 'early_stopping'],
-                    'dropout_rate': 0.3,
-                    'patience': 5
-                }
+                'structure_option': 'medium', 'activation_fn': 'sigmoid',
+                'loss_type': 'cross_entropy', 'optimizer_type': 'sgd',
+                'learning_rate': 0.1, 'momentum': 0.9, 'num_epochs': 15, 'batch_size': 64,
+                'regularization_methods': ['dropout'], 'dropout_rate': 0.3,
+                'early_stopping': False, 'patience': 5
             })
-        else:  # CNN
-            config.update({
-                'structure_option': 'medium',  # [32, 64]
-                'activation_fn': 'relu',
-                'pool_type': 'max',
-                'loss_type': 'cross_entropy',
-                'optimizer_type': 'adam',
-                'learning_rate': 0.001,
-                'num_epochs': 10,
-                'batch_size': 64,
-                'regularization_config': {
-                    'methods': ['dropout', 'early_stopping'],
-                    'dropout_rate': 0.3,
-                    'patience': 5
-                }
-            })
-        
-        # 加载数据并训练模型
-        train_loader, test_loader = prepare_data_loaders(config)
-        model = create_model(
-            config['model_type'],
-            config['structure_option'],
-            config.get('regularization_config', {}).get('dropout_rate', 0.0),
-            config['activation_fn'],
-            config.get('pool_type', 'max')
-        )
-        
-        # 训练和测试
-        model, _ = train_model(model, train_loader, train_loader, config)  # 使用训练集作为验证集
-        accuracy = test_model(model, test_loader, config['device'])
-        print(f"使用推荐配置的最终测试准确率: {accuracy:.2f}%")
-    
+        elif model_type == 'cnn':
+             config.update({
+                'structure_option': 'medium', 'activation_fn': 'relu', # CNN 常用 ReLU
+                'loss_type': 'cross_entropy', 'optimizer_type': 'sgd',
+                'learning_rate': 0.05, 'momentum': 0.9, 'num_epochs': 10, 'batch_size': 64, # CNN 可能收敛更快
+                'regularization_methods': ['dropout'], 'dropout_rate': 0.4, # CNN 可能需要更高 dropout
+                'early_stopping': False, 'patience': 5
+             })
+        print("\n使用推荐配置:")
+        print(config)
+
     elif run_mode == '使用贝叶斯优化寻找最佳配置':
-        # 配置贝叶斯优化边界
-        if model_type == 'mlp':
-            config['pbounds'] = {
-                'learning_rate': (0.001, 0.1),
-                'num_epochs': (5, 15),
-                'batch_size': (16, 128),
-                'k_folds': (3, 5),
-                'structure_index': (0, 2),  # 小型、中型或大型结构
-                'momentum': (0.5, 0.99),
-                'dropout_rate': (0.0, 0.5),
-                'l1_lambda': (0.0001, 0.01),
-                'weight_decay': (0.0001, 0.01)
-            }
-        else:  # CNN
-            config['pbounds'] = {
-                'learning_rate': (0.001, 0.1),
-                'num_epochs': (5, 15),
-                'batch_size': (16, 128),
-                'k_folds': (3, 5),
-                'structure_index': (0, 2),  # 小型、中型或大型结构
-                'momentum': (0.5, 0.99),
-                'dropout_rate': (0.0, 0.5)
-            }
-        
-        # 运行贝叶斯优化
-        best_params = run_bayesian_optimization(config, init_points=5, n_iter=10)
-        
-        # 比较不同的正则化方法
-        regularization_results = compare_regularization_methods(best_params, config)
-        print("贝叶斯优化和正则化比较完成。")
-    
-    else:  # 手动配置
-        # 结构选择
+        print("\n为贝叶斯优化设置基础参数:")
+        config['num_epochs'] = get_user_int("输入 K-Fold 训练轮数 (用于评估):", 5) # 优化时减少轮数
+        config['batch_size'] = get_user_int("输入批量大小:", 64)
+        config['loss_type'] = get_user_choice("选择损失函数:", ['cross_entropy', 'mse'])
+        config['optimizer_type'] = 'sgd' # 优化器固定为 SGD
+        # 其他固定参数如 data_dir 已设置
+
+        init_points = get_user_int("输入贝叶斯优化初始点数:", 3)
+        n_iter = get_user_int("输入贝叶斯优化迭代次数:", 7)
+
+        best_params = run_bayesian_optimization(config, init_points, n_iter)
+        if best_params:
+             print("\n找到的最佳配置将用于后续训练。")
+             config.update(best_params) # 更新 config 为找到的最佳参数
+             # 可能需要重置训练轮数
+             config['num_epochs'] = get_user_int("输入使用最佳配置的最终训练轮数:", 15)
+        else:
+             print("贝叶斯优化失败或未找到结果。")
+             return # 提前退出
+
+    # elif run_mode == '比较正则化方法':
+    #     # 需要先运行贝叶斯优化或手动指定基础参数
+    #     print("\n比较正则化方法需要一组基础超参数。")
+    #     choice = get_user_choice("从哪里获取基础参数?", ["运行贝叶斯优化", "手动输入"])
+    #     if choice == "运行贝叶斯优化":
+    #          config['num_epochs'] = get_user_int("输入 K-Fold 训练轮数 (用于评估):", 5)
+    #          config['batch_size'] = get_user_int("输入批量大小:", 64)
+    #          config['loss_type'] = get_user_choice("选择损失函数:", ['cross_entropy', 'mse'])
+    #          init_points = get_user_int("输入贝叶斯优化初始点数:", 3)
+    #          n_iter = get_user_int("输入贝叶斯优化迭代次数:", 7)
+    #          best_params = run_bayesian_optimization(config, init_points, n_iter)
+    #          if not best_params:
+    #              print("贝叶斯优化失败，无法比较。")
+    #              return
+    #     else: # 手动输入基础参数用于比较
+    #          best_params = {}
+    #          structure_options = ['small', 'medium', 'large']
+    #          best_params['structure_option'] = get_user_choice(f"选择 {model_type.upper()} 结构:", structure_options)
+    #          activation_options = ['relu', 'sigmoid', 'tanh', 'leaky_relu']
+    #          best_params['activation_fn'] = get_user_choice("选择激活函数:", activation_options)
+    #          best_params['learning_rate'] = get_user_float("输入学习率:", 0.01)
+    #          best_params['momentum'] = get_user_float("输入动量:", 0.9)
+    #          config['loss_type'] = get_user_choice("选择损失函数:", ['cross_entropy', 'mse'])
+    #          config['optimizer_type'] = 'sgd'
+    #          config['num_epochs'] = get_user_int("输入训练轮数:", 10)
+    #          config['batch_size'] = get_user_int("输入批量大小:", 64)
+    #
+    #     compare_regularization_methods(best_params, config)
+    #     print("\n程序执行完成。")
+    #     return # 比较后退出
+
+    else: # 手动配置
+        print("\n手动配置参数:")
         structure_options = ['small', 'medium', 'large']
-        config['structure_option'] = get_user_choice(
-            f"选择 {model_type.upper()} 结构大小:", 
-            structure_options
-        )
-        
-        # 激活函数
+        config['structure_option'] = get_user_choice(f"选择 {model_type.upper()} 结构大小:", structure_options)
         activation_options = ['relu', 'sigmoid', 'tanh', 'leaky_relu']
         config['activation_fn'] = get_user_choice("选择激活函数:", activation_options)
-        
-        # 池化类型 (仅 CNN)
-        if model_type == 'cnn':
-            pool_options = ['max', 'avg']
-            config['pool_type'] = get_user_choice("选择池化类型:", pool_options)
-        
-        # 损失函数
         loss_options = ['cross_entropy', 'mse']
         config['loss_type'] = get_user_choice("选择损失函数:", loss_options)
-        
-        # 优化器
-        optimizer_options = ['sgd', 'adam', 'adamw', 'rmsprop']
+        optimizer_options = ['sgd']
         config['optimizer_type'] = get_user_choice("选择优化器:", optimizer_options)
-        
-        # 超参数
+
         config['learning_rate'] = get_user_float("输入学习率:", 0.01)
         config['num_epochs'] = get_user_int("输入训练轮数:", 10)
         config['batch_size'] = get_user_int("输入批量大小:", 64)
-        
         if config['optimizer_type'] == 'sgd':
-            config['momentum'] = get_user_float("输入动量:", 0.9)
-        
-        # 正则化
+            config['momentum'] = get_user_float("输入动量 (0 表示不用):", 0.9)
+
         reg_methods = []
-        config['regularization_config'] = {'methods': reg_methods}
-        
-        # L1 正则化
-        use_l1 = get_user_choice("使用 L1 正则化?", ['是', '否'])
-        if use_l1 == '是':
-            reg_methods.append('l1')
-            config['regularization_config']['l1_lambda'] = get_user_float("输入 L1 lambda:", 0.0001)
-        
-        # L2 正则化
-        use_l2 = get_user_choice("使用 L2 正则化?", ['是', '否'])
-        if use_l2 == '是':
-            reg_methods.append('l2')
-            config['regularization_config']['weight_decay'] = get_user_float("输入 L2 weight decay:", 0.0001)
-        
-        # Dropout
         use_dropout = get_user_choice("使用 Dropout?", ['是', '否'])
         if use_dropout == '是':
             reg_methods.append('dropout')
-            config['regularization_config']['dropout_rate'] = get_user_float("输入 Dropout 比率:", 0.3)
-        
-        # 早停
-        use_early_stopping = get_user_choice("使用早停?", ['是', '否'])
+            config['dropout_rate'] = get_user_float("输入 Dropout 比率:", 0.3)
+        else:
+             config['dropout_rate'] = 0.0
+
+        use_early_stopping = get_user_choice("使用早停? (需要K-Fold或独立验证集，否则无效):", ['是', '否'])
         if use_early_stopping == '是':
             reg_methods.append('early_stopping')
-            config['regularization_config']['patience'] = get_user_int("输入早停耐心值:", 5)
-        
-        # 加载数据并训练模型
-        train_loader, test_loader = prepare_data_loaders(config)
-        model = create_model(
-            config['model_type'],
-            config['structure_option'],
-            config['regularization_config'].get('dropout_rate', 0.0) if 'dropout' in reg_methods else 0.0,
-            config['activation_fn'],
-            config.get('pool_type', 'max')
-        )
-        
-        # 训练和测试
-        model, _ = train_model(model, train_loader, train_loader, config)  # 使用训练集作为验证集
-        accuracy = test_model(model, test_loader, config['device'])
-        print(f"使用手动配置的最终测试准确率: {accuracy:.2f}%")
-    
-    print("程序执行完成。")
+            config['patience'] = get_user_int("输入早停耐心值:", 5)
+        else:
+            config['early_stopping'] = False
 
+        config['regularization_methods'] = reg_methods
+
+    # --- 配置最终处理和运行 ---
+    # 确保 loss_type 和 use_one_hot 匹配
+    config['use_one_hot'] = config['loss_type'].lower() == 'mse'
+    # 更新正则化配置字典
+    config['regularization_config'] = configure_regularization(config)
+
+    # 加载数据
+    print("\n加载数据...")
+    train_loader_info, test_loader_info = prepare_data_loaders(config)
+
+    # 创建模型
+    print("创建模型...")
+    model = create_model(
+        config['model_type'],
+        config.get('structure_option', 'medium'),
+        config['regularization_config'].get('dropout_rate', 0.0),
+        config.get('activation_fn', 'relu')
+    )
+
+    # 训练模型 (手动配置和推荐配置模式下，不使用验证集进行早停)
+    # 如果需要早停，需要修改这里，例如划分一部分训练数据作为验证集
+    print("\n开始训练...")
+    use_val_for_train = config['regularization_config'].get('early_stopping', False)
+    if use_val_for_train:
+        print("警告: 早停已启用，但未使用独立的验证集或 K-Fold，可能效果不佳。")
+        # 可以考虑在这里拆分 train_loader_info 来创建一个 val_loader_info
+        # ... 拆分逻辑 ...
+        # model, history = train_model(model, train_subset_loader, val_subset_loader, config)
+        model, history = train_model(model, train_loader_info, None, config) # 暂不拆分
+    else:
+        model, history = train_model(model, train_loader_info, None, config)
+
+    # 测试模型
+    print("\n开始测试...")
+    accuracy = test_model(model, test_loader_info, loss_type=config['loss_type'])
+    print(f"\n最终测试准确率: {accuracy:.2f}%")
+
+    print("\n程序执行完成。")
+
+
+# --- 用户交互辅助函数 ---
 def get_user_choice(prompt, options):
-    """
-    获取用户输入的选项
-    
-    Args:
-        prompt: 提示信息
-        options: 选项列表
-        
-    Returns:
-        用户选择的选项
-    """
     print(prompt)
     for i, option in enumerate(options):
         print(f"{i+1}. {option}")
-    
     while True:
         try:
             choice = int(input("请输入选项编号: "))
@@ -1015,19 +1300,10 @@ def get_user_choice(prompt, options):
             print("请输入数字。")
 
 def get_user_float(prompt, default=None):
-    """
-    获取用户输入的浮点数
-    
-    Args:
-        prompt: 提示信息
-        default: 默认值
-        
-    Returns:
-        浮点数输入
-    """
     while True:
         try:
-            val_str = input(f"{prompt} (默认: {default}): ")
+            default_str = f" (默认: {default})" if default is not None else ""
+            val_str = input(f"{prompt}{default_str}: ")
             if not val_str and default is not None:
                 return default
             return float(val_str)
@@ -1035,22 +1311,38 @@ def get_user_float(prompt, default=None):
             print("请输入有效的数字。")
 
 def get_user_int(prompt, default=None):
-    """
-    获取用户输入的整数
-    
-    Args:
-        prompt: 提示信息
-        default: 默认值
-        
-    Returns:
-        整数输入
-    """
     while True:
         try:
-            val_str = input(f"{prompt} (默认: {default}): ")
+            default_str = f" (默认: {default})" if default is not None else ""
+            val_str = input(f"{prompt}{default_str}: ")
             if not val_str and default is not None:
                 return default
             return int(val_str)
         except ValueError:
-            print("请输入有效的数字。")
+            print("请输入有效的整数。")
+
+def get_user_input_path(prompt, default=None):
+    while True:
+        default_str = f" (默认: {default})" if default is not None else ""
+        path_str = input(f"{prompt}{default_str}: ")
+        path_to_check = path_str if path_str else default
+
+        if path_to_check and os.path.exists(path_to_check) and os.path.isdir(path_to_check):
+            # 检查必要的 MNIST 文件是否存在
+            required_files = [
+                "train-images-idx3-ubyte.gz", "train-labels-idx1-ubyte.gz",
+                "t10k-images-idx3-ubyte.gz", "t10k-labels-idx1-ubyte.gz"
+            ]
+            files_exist = all(os.path.exists(os.path.join(path_to_check, f)) for f in required_files)
+            if files_exist:
+                print(f"使用有效的数据路径: {path_to_check}")
+                return path_to_check
+            else:
+                 print(f"错误: 路径 '{path_to_check}' 中缺少 MNIST 文件。请确保包含 {required_files}")
+        else:
+             print(f"错误: 路径 '{path_to_check}' 不存在或不是一个有效的目录。请重新输入。")
+
+
+if __name__ == '__main__':
+     main()
 

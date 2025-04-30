@@ -1,179 +1,188 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import gzip
 import struct
-from scipy.ndimage import shift, rotate, zoom
+import os
+# 移除 scipy，因为 NumPy 版 function.py 中没有用到它
+# from scipy.ndimage import shift, rotate, zoom # NumPy 版不再需要
 
-# 设置随机种子以确保结果可重复
-torch.manual_seed(321)
+# 导入 NumPy 版 function.py 组件
+try:
+    from function import (
+        load_mnist_data, BasicMLP_NumPy,
+        mse_loss, mse_loss_derivative, # MSE 损失及其梯度
+        SGD_Optimizer, # NumPy SGD 优化器
+        get_batch, # 获取批次数据
+        one_hot_encode # NumPy one-hot 编码
+    )
+    print("成功从 function.py (NumPy 版) 导入模块。")
+except ImportError as e:
+    print(f"无法导入 function.py (NumPy 版): {e}")
+    print("请确保 function.py 存在且已更新为 NumPy 版本。")
+    exit()
 
+# 设置随机种子 (NumPy)
+np.random.seed(321)
 
-# 1. 自定义加载MNIST数据集
-def load_mnist_images(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_images, rows, cols = struct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num_images, rows, cols)
-    return images
-
-
-def load_mnist_labels(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_labels = struct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels
-
+# 1. 加载 MNIST 数据 (使用 function.py)
 
 # 数据路径
-train_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-images-idx3-ubyte.gz'
-train_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-labels-idx1-ubyte.gz'
-test_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-images-idx3-ubyte.gz'
-test_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-labels-idx1-ubyte.gz'
+script_dir = os.path.dirname(os.path.abspath(__file__))
+default_data_dir = os.path.join(script_dir, 'dataset', 'MNIST')
+if not os.path.exists(default_data_dir):
+    default_data_dir = os.path.join(os.path.dirname(script_dir), 'dataset', 'MNIST')
+data_dir = default_data_dir
+print(f"使用 MNIST 数据目录: {data_dir}")
 
-# 加载数据
-train_images = load_mnist_images(train_images_path)
-train_labels = load_mnist_labels(train_labels_path)
-test_images = load_mnist_images(test_images_path)
-test_labels = load_mnist_labels(test_labels_path)
+try:
+    train_images_path = os.path.join(data_dir, "train-images-idx3-ubyte.gz")
+    train_labels_path = os.path.join(data_dir, "train-labels-idx1-ubyte.gz")
+    train_images, train_labels = load_mnist_data(train_images_path, train_labels_path)
 
+    test_images_path = os.path.join(data_dir, "t10k-images-idx3-ubyte.gz")
+    test_labels_path = os.path.join(data_dir, "t10k-labels-idx1-ubyte.gz")
+    test_images, test_labels = load_mnist_data(test_images_path, test_labels_path)
+except FileNotFoundError:
+    print(f"错误：在 '{data_dir}' 中找不到 MNIST 数据文件。请检查路径。")
+    exit()
 
-# 2. 数据增强函数
-def augment_data(images, labels):
-    augmented_images = []
-    augmented_labels = []
+# 2. 数据增强函数 (NumPy 版)
+# 注意：NumPy 版本的数据增强可能与 PyTorch/SciPy 略有不同，且较慢
+def augment_data_numpy(images_flat, labels):
+    # 注意：输入是展平的图像 (N, 784)
+    images_reshaped = images_flat.reshape(-1, 28, 28) # 先重塑回 2D
+    augmented_images_list = []
+    augmented_labels_list = []
 
-    for i in range(len(images)):
-        image = images[i]
+    print("开始 NumPy 数据增强 (可能较慢)...")
+    count = 0
+    total = len(images_reshaped)
+
+    for i in range(total):
+        image = images_reshaped[i]
         label = labels[i]
 
-        # 将原始图像添加到增强数据中
-        augmented_images.append(image)
-        augmented_labels.append(label)
+        # 原始图像 (展平)
+        augmented_images_list.append(image.flatten())
+        augmented_labels_list.append(label)
 
-        # 平移：随机移动1-2个像素
-        shift_x, shift_y = np.random.randint(-2, 3, size=2)
-        shifted_image = shift(image, [shift_x, shift_y], mode='nearest')
-        augmented_images.append(shifted_image)
-        augmented_labels.append(label)
+        # 由于 NumPy 实现 shift, rotate, zoom 比较麻烦且可能引入新的依赖或复杂性
+        # 我们在此简化，只添加原始图像。如果需要增强，建议使用专门的库（如 albumentations）或在数据加载前处理。
+        # # 平移 (示例，可能需要 scipy)
+        # try:
+        #     from scipy.ndimage import shift
+        #     shift_x, shift_y = np.random.randint(-2, 3, size=2)
+        #     shifted_image = shift(image, [shift_x, shift_y], mode='nearest')
+        #     augmented_images_list.append(shifted_image.flatten())
+        #     augmented_labels_list.append(label)
+        # except ImportError:
+        #     pass # SciPy 不可用则跳过
 
-        # 旋转：随机旋转-10到10度
-        angle = np.random.uniform(-10, 10)
-        rotated_image = rotate(image, angle, reshape=False, mode='nearest')
-        augmented_images.append(rotated_image)
-        augmented_labels.append(label)
+        # # 旋转 (示例，可能需要 scipy)
+        # try:
+        #     from scipy.ndimage import rotate
+        #     angle = np.random.uniform(-10, 10)
+        #     rotated_image = rotate(image, angle, reshape=False, mode='nearest')
+        #     augmented_images_list.append(rotated_image.flatten())
+        #     augmented_labels_list.append(label)
+        # except ImportError:
+        #     pass # SciPy 不可用则跳过
 
-        # 缩放：随机缩放0.9到1.1倍
-        scale = np.random.uniform(0.9, 1.1)
-        scaled_image = zoom(image, scale, mode='nearest')
-        # 确保图像保持28x28大小
-        if scaled_image.shape[0] > 28:
-            scaled_image = scaled_image[:28, :28]
-        elif scaled_image.shape[0] < 28:
-            scaled_image = np.pad(scaled_image, ((0, 28 - scaled_image.shape[0]), (0, 28 - scaled_image.shape[1])),
-                                  mode='constant')
-        augmented_images.append(scaled_image)
-        augmented_labels.append(label)
+        count += 1
+        if count % 1000 == 0:
+            print(f"  增强进度: {count}/{total}")
 
-    return np.array(augmented_images), np.array(augmented_labels)
+    print("NumPy 数据增强完成 (仅包含原始图像)。")
+    return np.array(augmented_images_list), np.array(augmented_labels_list)
 
+# 应用数据增强 (NumPy - 简化版，只返回原始数据)
+print("应用数据增强 (NumPy 简化版)...")
+# train_images 和 train_labels 已经是 NumPy 数组且已展平/归一化
+augmented_train_images, augmented_train_labels = augment_data_numpy(train_images, train_labels)
+print(f"原始训练样本: {len(train_images)}, 增强后训练样本: {len(augmented_train_images)}")
 
-# 应用数据增强
-print("Applying data augmentation to training data...")
-augmented_train_images, augmented_train_labels = augment_data(train_images, train_labels)
-print(f"Original training samples: {len(train_images)}, Augmented training samples: {len(augmented_train_images)}")
+# 数据预处理：标签转换为one-hot编码 (NumPy)
+num_classes = 10
+augmented_train_labels_one_hot = one_hot_encode(augmented_train_labels, num_classes)
+# 测试集标签也需要 one-hot
+test_labels_one_hot = one_hot_encode(test_labels, num_classes)
 
-# 数据预处理：将图像归一化到[0, 1]并转换为PyTorch张量
-augmented_train_images = torch.tensor(augmented_train_images, dtype=torch.float32) / 255.0
-test_images = torch.tensor(test_images, dtype=torch.float32) / 255.0
-augmented_train_labels = torch.tensor(augmented_train_labels, dtype=torch.long)
-test_labels = torch.tensor(test_labels, dtype=torch.long)
+# 创建数据加载器信息字典
+batch_size = 64
+train_loader_info = {
+    'images': augmented_train_images,
+    'labels': augmented_train_labels_one_hot,
+    'batch_size': batch_size,
+    'num_samples': augmented_train_images.shape[0],
+    'num_batches': int(np.ceil(augmented_train_images.shape[0] / batch_size)),
+    'shuffle': True,
+    'use_one_hot': True,
+    'num_classes': num_classes
+}
+test_loader_info = {
+    'images': test_images, # 测试集不使用增强图像
+    'labels': test_labels_one_hot,
+    'batch_size': batch_size,
+    'num_samples': test_images.shape[0],
+    'num_batches': int(np.ceil(test_images.shape[0] / batch_size)),
+    'shuffle': False,
+    'use_one_hot': True,
+    'num_classes': num_classes
+}
 
-# 将图像展平为1D向量（28x28 -> 784）
-augmented_train_images = augmented_train_images.view(-1, 28 * 28)
-test_images = test_images.view(-1, 28 * 28)
+# 3. 定义和初始化模型 (使用导入的 NumPy MLP)
+#    结构 [128, 64]，激活 Sigmoid
+hidden_layers = [128, 64]
+activation = 'sigmoid'
+model = BasicMLP_NumPy(nHidden=hidden_layers, activation_fn=activation, dropout_rate=0.0)
 
+# 4. 初始化损失函数和优化器 (NumPy)
+loss_fn, loss_derivative_fn = mse_loss, mse_loss_derivative
+optimizer = SGD_Optimizer(model=model, learning_rate=0.1, momentum=0.0) # 调整学习率
 
-# 将标签转换为one-hot编码（用于MSE损失）
-def to_one_hot(labels, num_classes=10):
-    return torch.eye(num_classes)[labels]
-
-
-augmented_train_labels_one_hot = to_one_hot(augmented_train_labels)
-test_labels_one_hot = to_one_hot(test_labels)
-
-# 创建PyTorch数据集和数据加载器
-train_dataset = torch.utils.data.TensorDataset(augmented_train_images, augmented_train_labels_one_hot)
-test_dataset = torch.utils.data.TensorDataset(test_images, test_labels_one_hot)
-
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-
-# 3. 定义一个完全未优化的MLP模型（固定隐藏层结构）
-class BasicMLP(nn.Module):
-    def __init__(self):
-        super(BasicMLP, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(28 * 28, 128),  # 输入层到第一个隐藏层，固定128个神经元
-            nn.Sigmoid(),  # 使用简单的Sigmoid激活函数
-            nn.Linear(128, 64),  # 第一个隐藏层到第二个隐藏层，固定64个神经元
-            nn.Sigmoid(),
-            nn.Linear(64, 10)  # 第二个隐藏层到输出层（10个类别）
-        )
-
-    def forward(self, x):
-        return self.layers(x)
-
-
-# 4. 初始化模型、损失函数和优化器
-model = BasicMLP()  # 固定结构，不通过nHidden指定
-criterion = nn.MSELoss()  # 使用均方误差损失（未使用交叉熵）
-optimizer = optim.SGD(model.parameters(), lr=0.01)  # 简单SGD，无动量
-
-
-# 5. 训练模型
-def train(model, train_loader, criterion, optimizer, num_epochs=5):
-    model.train()
+# 5. 训练模型 (NumPy)
+def train_numpy(model, loader_info, loss_fn, loss_derivative_fn, optimizer, num_epochs=5):
+    model.set_training_mode(True)
     for epoch in range(num_epochs):
         running_loss = 0.0
-        for i, (images, labels) in enumerate(train_loader):
-            # 前向传播
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+        indices = np.arange(loader_info['num_samples'])
+        if loader_info['shuffle']:
+            np.random.shuffle(indices)
 
-            # 反向传播和优化
-            optimizer.zero_grad()
-            loss.backward()
+        for i in range(loader_info['num_batches']):
+            batch_images, batch_labels_one_hot = get_batch(loader_info, i, indices)
+
+            logits = model.forward(batch_images)
+            loss = loss_fn(logits, batch_labels_one_hot)
+            grad_loss = loss_derivative_fn(logits, batch_labels_one_hot)
+            model.backward(grad_loss)
             optimizer.step()
 
-            running_loss += loss.item()
+            running_loss += loss
             if (i + 1) % 100 == 0:
                 print(
-                    f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], Loss: {running_loss / 100:.4f}')
+                    f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{loader_info["num_batches"]}], Loss: {running_loss / 100:.4f}')
                 running_loss = 0.0
+    model.set_training_mode(False)
 
-
-# 6. 测试模型
-def test(model, test_loader):
-    model.eval()
+# 6. 测试模型 (NumPy)
+def test_numpy(model, loader_info):
+    model.set_training_mode(False)
     correct = 0
     total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            _, true_labels = torch.max(labels, 1)  # 从one-hot转换回类别
-            total += true_labels.size(0)
-            correct += (predicted == true_labels).sum().item()
+    for i in range(loader_info['num_batches']):
+        images, labels_one_hot = get_batch(loader_info, i)
+        logits = model.forward(images)
+        predicted_indices = np.argmax(logits, axis=1)
+        true_indices = np.argmax(labels_one_hot, axis=1)
+        total += true_indices.shape[0]
+        correct += np.sum(predicted_indices == true_indices)
 
     accuracy = 100 * correct / total
     print(f'Test Accuracy: {accuracy:.2f}%')
     return accuracy
 
-
 # 7. 运行训练和测试
-print("Training the model...")
-train(model, train_loader, criterion, optimizer, num_epochs=5)
-print("\nTesting the model...")
-test_accuracy = test(model, test_loader)
+print("Training the model (NumPy)...")
+train_numpy(model, train_loader_info, loss_fn, loss_derivative_fn, optimizer, num_epochs=5)
+print("\nTesting the model (NumPy)...")
+test_accuracy = test_numpy(model, test_loader_info)

@@ -1,6 +1,3 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import gzip
 import struct
@@ -9,239 +6,266 @@ from bayes_opt import BayesianOptimization
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import os # Add os import
+import sys # Import sys for exit
 
-# 设置使用 GPU（如果可用）
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+# --- 导入 NumPy 版 function.py 组件 ---
+try:
+    # 使用 function.py 中正确的类名
+    from function import (
+        prepare_data_loaders, get_batch, # NumPy data utils
+        cross_entropy_loss, cross_entropy_loss_derivative, # NumPy Cross Entropy Loss
+        SGD_Optimizer, # NumPy Optimizer
+        ConvLayer, PoolingLayer, ActivationLayer, FlattenLayer, LinearLayer, DropoutLayer, # NumPy Layers (Correct Names, ActivationLayer instead of ReLULayer)
+        BasicCNN_NumPy # Import the NumPy CNN definition from function.py
+    )
+    print("成功从 function.py (NumPy 版) 导入模块。")
+except ImportError as e:
+    print(f"无法从 function.py (NumPy 版) 导入必要的模块: {e}")
+    print("请确保 function.py 文件存在，并且包含以下 NumPy 类：")
+    print("ConvLayer, PoolingLayer, ActivationLayer, FlattenLayer, LinearLayer, DropoutLayer, BasicCNN_NumPy, SGD_Optimizer, etc.")
+    sys.exit(1) # 导入失败则退出
+# --------------------------------------
 
-# 加载 MNIST 数据集
-def load_mnist_images(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_images, rows, cols = struct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num_images, rows, cols)
-    return images
+# 移除 PyTorch Device 设置 / GPU 支持
+device = 'cpu'
+print("Using device: CPU (NumPy)")
 
-def load_mnist_labels(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_labels = struct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels
+# 移除 PyTorch MNIST 加载函数
+# def load_mnist_images(file_path): ...
+# def load_mnist_labels(file_path): ...
 
-# 数据路径
+# 数据路径 (保持不变)
 train_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-images-idx3-ubyte.gz'
 train_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-labels-idx1-ubyte.gz'
 test_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-images-idx3-ubyte.gz'
 test_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-labels-idx1-ubyte.gz'
 
-# 加载和预处理数据
-train_images = load_mnist_images(train_images_path)
-train_labels = load_mnist_labels(train_labels_path)
-test_images = load_mnist_images(test_images_path)
-test_labels = load_mnist_labels(test_labels_path)
+# --- 使用 NumPy prepare_data_loaders 加载和预处理数据 (CNN -> N, C, H, W) ---
+print("使用 NumPy prepare_data_loaders 加载数据 (CNN, Cross Entropy)...")
+config_load = {
+    'model_type': 'cnn',
+    'batch_size': 64,
+    'loss_type': 'cross_entropy',
+    'data_dir': os.path.dirname(train_images_path)
+}
+try:
+    train_loader_info_full, test_loader_info = prepare_data_loaders(config_load)
+    print(f"NumPy 数据加载完成。训练数据形状: {train_loader_info_full['images'].shape}, 测试数据形状: {test_loader_info['images'].shape}")
+except FileNotFoundError as e:
+     print(f"错误: {e}")
+     exit()
+# 移除旧的 PyTorch 加载和预处理代码
+# ...
+# ---------------------------------------------------------------------------
 
-# 归一化并转换为张量（注意转为 float 同时除以 255.0）
-train_images = torch.tensor(train_images, dtype=torch.float32) / 255.0
-test_images = torch.tensor(test_images, dtype=torch.float32) / 255.0
-train_labels = torch.tensor(train_labels, dtype=torch.long)
-test_labels = torch.tensor(test_labels, dtype=torch.long)
+# 移除 PyTorch CNN 定义
+# class BasicCNN(nn.Module): ...
+# BasicCNN_NumPy 应该已从 function.py 成功导入
 
-# 添加通道维度，调整为 CNN 输入格式： [N, 1, 28, 28]
-train_images = train_images.unsqueeze(1)
-test_images = test_images.unsqueeze(1)
+print("使用导入的 NumPy 版 BasicCNN_NumPy 模型。")
 
-# 创建测试数据集和 DataLoader
-test_dataset = torch.utils.data.TensorDataset(test_images, test_labels)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-# 定义具有可配置卷积层和 dropout 的 CNN 模型
-class BasicCNN(nn.Module):
-    def __init__(self, conv_filters, dropout_rate=0.0):
-        super(BasicCNN, self).__init__()
-        self.conv_layers = nn.Sequential(
-            # 第一层卷积
-            nn.Conv2d(in_channels=1, out_channels=conv_filters[0], kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 输出: [N, conv_filters[0], 14, 14]
-            
-            # 第二层卷积
-            nn.Conv2d(in_channels=conv_filters[0], out_channels=conv_filters[1], kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)   # 输出: [N, conv_filters[1], 7, 7]
-        )
-        
-        # 展平后特征的维度
-        self.flatten_dim = conv_filters[1] * 7 * 7
-        
-        # 全连接层
-        self.fc_layers = nn.Sequential(
-            nn.Linear(self.flatten_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity(),
-            nn.Linear(128, 10)  # 输出：10 类
-        )
-
-    def forward(self, x):
-        x = self.conv_layers(x)
-        x = x.view(x.size(0), -1)  # 展平
-        x = self.fc_layers(x)
-        return x  # 返回原始 logits
-
-# 训练函数（去除 L1 正则化相关部分）
-def train(model, train_loader, val_loader, criterion, optimizer, num_epochs, regularization=None, patience=5):
+# Training function (NumPy version for Cross Entropy - adapted for CNN from v8)
+def train_numpy_ce(model, loader_info, val_loader_info, loss_fn, loss_deriv_fn, optimizer, num_epochs, regularization=None, patience=5):
     best_val_loss = float('inf')
     epochs_no_improve = 0
     for epoch in range(num_epochs):
-        model.train()
+        model.set_training_mode(True)
         running_loss = 0.0
-        for i, (images, labels) in enumerate(train_loader):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            optimizer.zero_grad()
-            loss.backward()
+        indices = np.arange(loader_info['num_samples'])
+        if loader_info['shuffle']:
+            np.random.shuffle(indices)
+        # Use tqdm for batch iteration
+        for i in tqdm(range(loader_info['num_batches']), desc=f'Epoch {epoch+1}', leave=False):
+            batch_images, batch_labels_indices = get_batch(loader_info, i, indices)
+            logits = model.forward(batch_images)
+            loss = loss_fn(logits, batch_labels_indices)
+            grad_loss = loss_deriv_fn(logits, batch_labels_indices)
+            model.backward(grad_loss)
             optimizer.step()
-            running_loss += loss.item()
-            if (i + 1) % 100 == 0:
-                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {running_loss/100:.4f}')
-                running_loss = 0.0
-        
-        # 针对 early_stopping 的验证
-        if regularization == 'early_stopping' and val_loader:
-            model.eval()
+            running_loss += loss
+            # Optional: Log less frequently inside tqdm loop
+            # if (i + 1) % 100 == 0:
+            #     print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{loader_info["num_batches"]}], Avg Loss: {running_loss/(i+1):.4f}')
+        epoch_avg_loss = running_loss / loader_info['num_batches']
+        print(f'Epoch [{epoch+1}/{num_epochs}] Completed, Average Loss: {epoch_avg_loss:.4f}')
+
+        if regularization == 'early_stopping' and val_loader_info:
+            model.set_training_mode(False)
             val_loss = 0.0
-            with torch.no_grad():
-                for images, labels in val_loader:
-                    images, labels = images.to(device), labels.to(device)
-                    outputs = model(images)
-                    val_loss += criterion(outputs, labels).item()
-            val_loss /= len(val_loader)
-            print(f'Validation Loss: {val_loss:.4f}')
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            for i in range(val_loader_info['num_batches']):
+                val_images, val_labels_indices = get_batch(val_loader_info, i)
+                val_logits = model.forward(val_images)
+                batch_val_loss = loss_fn(val_logits, val_labels_indices)
+                val_loss += batch_val_loss
+            epoch_val_loss = val_loss / val_loader_info['num_batches']
+            print(f'Validation Loss: {epoch_val_loss:.4f}')
+            if epoch_val_loss < best_val_loss:
+                best_val_loss = epoch_val_loss
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= patience:
                     print(f'Early stopping at epoch {epoch+1}')
                     break
+    model.set_training_mode(False)
 
-# 测试函数（在 GPU 上运行）
-def test(model, test_loader):
-    model.eval()
+# Testing function (NumPy version for Cross Entropy - adapted for CNN from v8)
+def test_numpy_ce(model, loader_info):
+    model.set_training_mode(False)
     correct = 0
     total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+    for i in range(loader_info['num_batches']):
+        images, labels_indices = get_batch(loader_info, i)
+        logits = model.forward(images)
+        predicted_indices = np.argmax(logits, axis=1)
+        total += labels_indices.shape[0]
+        correct += np.sum(predicted_indices == labels_indices)
     accuracy = 100 * correct / total
     return accuracy
 
-# 定义不同规模卷积层配置
+# 定义不同规模卷积层配置 (保持不变)
 conv_filters_candidates = [
-    [16, 32],    # 小型网络
-    [32, 64],    # 中型网络
-    [64, 128]    # 大型网络
+    [16, 32],
+    [32, 64],
+    [64, 128]
 ]
 
-# 目标函数（贝叶斯优化）
-def objective(lr, num_epochs, batch_size, k_folds, conv_filters_index, momentum, dropout_rate):
+# 目标函数（贝叶斯优化 - NumPy CNN version from v8)
+def objective_numpy_cnn(lr, num_epochs, batch_size, k_folds, conv_filters_index, momentum, dropout_rate):
     num_epochs = int(num_epochs)
     batch_size = int(batch_size)
     k_folds = int(k_folds)
-    conv_filters_index = int(conv_filters_index)
+    conv_filters_index = int(np.round(conv_filters_index))
+    if not 0 <= conv_filters_index < len(conv_filters_candidates):
+        conv_filters_index = 0
     conv_filters = conv_filters_candidates[conv_filters_index]
+
     regularization_types = ['none', 'dropout', 'early_stopping']
     fold_accuracies = {reg: [] for reg in regularization_types}
 
-    torch.manual_seed(42)
+    all_train_images = train_loader_info_full['images']
+    all_train_labels = train_loader_info_full['labels']
+    n_samples = train_loader_info_full['num_samples']
+    batch_size_fold = int(batch_size)
+
+    np.random.seed(42)
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
 
-    # 使用 tqdm 包裹 KFold 循环
-    for fold, (train_idx, val_idx) in enumerate(tqdm(kf.split(train_images), total=k_folds, desc='Folds')):
-        print(f'Fold {fold+1}/{k_folds}')
-        train_images_fold = train_images[train_idx]
-        train_labels_fold = train_labels[train_idx]
-        val_images_fold = train_images[val_idx]
-        val_labels_fold = train_labels[val_idx]
-
-        train_dataset_fold = torch.utils.data.TensorDataset(train_images_fold, train_labels_fold)
-        val_dataset_fold = torch.utils.data.TensorDataset(val_images_fold, val_labels_fold)
-
-        train_loader_fold = torch.utils.data.DataLoader(train_dataset_fold, batch_size=batch_size, shuffle=True)
-        val_loader_fold = torch.utils.data.DataLoader(val_dataset_fold, batch_size=batch_size, shuffle=False)
+    # Use tqdm for KFold loop
+    for fold, (train_idx, val_idx) in enumerate(tqdm(kf.split(np.arange(n_samples)), total=k_folds, desc='Folds')):
+        # print(f'Fold {fold+1}/{k_folds}') # tqdm provides progress
+        fold_train_loader_info = {
+            'images': all_train_images[train_idx], 'labels': all_train_labels[train_idx],
+            'batch_size': batch_size_fold, 'num_samples': len(train_idx),
+            'num_batches': int(np.ceil(len(train_idx) / batch_size_fold)),
+            'shuffle': True, 'use_one_hot': False, 'model_type': 'cnn'
+        }
+        fold_val_loader_info = {
+            'images': all_train_images[val_idx], 'labels': all_train_labels[val_idx],
+            'batch_size': batch_size_fold, 'num_samples': len(val_idx),
+            'num_batches': int(np.ceil(len(val_idx) / batch_size_fold)),
+            'shuffle': False, 'use_one_hot': False, 'model_type': 'cnn'
+        }
 
         for reg in regularization_types:
-            print(f'Training with {reg} regularization')
-            if reg == 'dropout':
-                model = BasicCNN(conv_filters, dropout_rate=dropout_rate).to(device)
-            else:
-                model = BasicCNN(conv_filters).to(device)
+            print(f'Fold {fold+1}, Training with {reg} regularization')
+            current_dropout_rate = dropout_rate if reg == 'dropout' else 0.0
+            model = BasicCNN_NumPy(conv_filters, dropout_rate=current_dropout_rate)
 
-            criterion = nn.CrossEntropyLoss()
-            optimizer_ = optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+            loss_fn_ce, loss_deriv_fn_ce = cross_entropy_loss, cross_entropy_loss_derivative
+            optimizer = SGD_Optimizer(model, learning_rate=lr, momentum=momentum)
 
-            train(model, train_loader_fold, val_loader_fold if reg == 'early_stopping' else None,
-                  criterion, optimizer_, num_epochs, regularization=reg)
-            val_accuracy = test(model, val_loader_fold)
+            train_numpy_ce(model, fold_train_loader_info, fold_val_loader_info if reg == 'early_stopping' else None,
+                           loss_fn_ce, loss_deriv_fn_ce, optimizer, num_epochs, regularization=reg, patience=5)
+            val_accuracy = test_numpy_ce(model, fold_val_loader_info)
             fold_accuracies[reg].append(val_accuracy)
             print(f'Fold {fold+1} {reg} Validation Accuracy: {val_accuracy:.2f}%')
 
     avg_val_accuracies = {reg: np.mean(acc) for reg, acc in fold_accuracies.items()}
     for reg, avg_acc in avg_val_accuracies.items():
         print(f'Average {reg} Validation Accuracy: {avg_acc:.2f}%')
-    return avg_val_accuracies['none']
+    return avg_val_accuracies.get('none', 0.0)
 
-# 定义贝叶斯优化的超参数边界
+# 定义贝叶斯优化的超参数边界 (NumPy CNN version from v8)
 pbounds = {
     'lr': (0.001, 0.1),
     'num_epochs': (5, 15),
     'batch_size': (16, 128),
     'k_folds': (3, 5),
-    'conv_filters_index': (0, len(conv_filters_candidates) - 1),
-    'momentum': (0.5, 0.99),
+    'conv_filters_index': (0, len(conv_filters_candidates) - 0.01),
+    'momentum': (0.0, 0.99),
     'dropout_rate': (0.0, 0.5)
 }
 
-optimizer = BayesianOptimization(f=objective, pbounds=pbounds, random_state=42)
+# Use the NumPy CNN objective function
+bo_optimizer = BayesianOptimization(f=objective_numpy_cnn, pbounds=pbounds, random_state=42, verbose=2)
 
 # 执行贝叶斯优化
-print("Starting Bayesian Optimization...")
-optimizer.maximize(init_points=5, n_iter=10)
+print("Starting Bayesian Optimization (NumPy CNN)...")
+bo_optimizer.maximize(init_points=5, n_iter=10)
 
 # 打印最佳超参数
-print("\n=== Best Hyperparameters ===")
-best_params = optimizer.max
+print("\n=== Best Hyperparameters (NumPy CNN) ===")
+best_params = bo_optimizer.max
 print(f"Best Average Validation Accuracy (no regularization): {best_params['target']:.2f}%")
 print(f"Best Parameters: {best_params['params']}")
 
-# 可视化卷积核的函数
+# 可视化卷积核的函数 (NumPy version)
 def visualize_conv_kernels(model):
-    conv1_weights = model.conv_layers[0].weight.data.cpu().numpy()  # Shape: [out_channels, 1, 3, 3]
-    num_filters = conv1_weights.shape[0]
+    # Find the first ConvLayer instance (使用正确的类名 ConvLayer)
+    first_conv_layer = None
+    for layer in model.layers:
+        if isinstance(layer, ConvLayer): # 使用正确的类名
+            first_conv_layer = layer
+            break
     
-    # 设置画布大小，显示所有滤波器
-    fig, axes = plt.subplots(1, num_filters, figsize=(15, 3))
-    if num_filters == 1:
-        axes = [axes]  # 确保 axes 是可迭代的
+    if first_conv_layer is None or not hasattr(first_conv_layer, 'weights'):
+        print("无法找到第一个卷积层或其权重。")
+        return
+        
+    # Assuming weights are stored in layer.weights with shape (out_channels, in_channels, K, K)
+    conv1_weights = first_conv_layer.weights
+    
+    if conv1_weights is None or conv1_weights.ndim != 4:
+         print(f"第一个卷积层的权重形状不符合预期 (预期 4D, 得到 {conv1_weights.ndim}D)。")
+         return
+         
+    num_filters = conv1_weights.shape[0]
+    print(f"可视化第一个卷积层的 {num_filters} 个滤波器...")
+    
+    # 设置画布大小
+    cols = 8 # Adjust layout as needed
+    rows = int(np.ceil(num_filters / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.5, rows * 1.5))
+    axes = axes.flatten() # Flatten to easily iterate
+
     for i in range(num_filters):
-        axes[i].imshow(conv1_weights[i, 0], cmap='gray')
-        axes[i].axis('off')
-        axes[i].set_title(f'Filter {i+1}')
+        if i < len(axes):
+            # Assuming input channel is 1 (grayscale)
+            kernel = conv1_weights[i, 0, :, :]
+            axes[i].imshow(kernel, cmap='gray')
+            axes[i].axis('off')
+            axes[i].set_title(f'F {i+1}')
+            
+    # Hide unused subplots
+    for j in range(num_filters, len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout()
     plt.show()
 
-# 使用最佳超参数训练最终模型并比较不同正则化方式，同时可视化卷积核
-def train_final_model(params):
-    print("\nTraining final model with best hyperparameters...")
-    torch.manual_seed(42)
+# 使用最佳超参数训练最终模型并比较不同正则化方式，同时可视化卷积核 (NumPy CNN version)
+def train_final_model_numpy_cnn(params):
+    print("\nTraining final model with best hyperparameters (NumPy CNN)...")
+    np.random.seed(42)
 
     lr = params['lr']
     num_epochs = int(params['num_epochs'])
     batch_size = int(params['batch_size'])
-    conv_filters_index = int(params['conv_filters_index'])
+    conv_filters_index = int(np.round(params['conv_filters_index']))
+    if not 0 <= conv_filters_index < len(conv_filters_candidates):
+        conv_filters_index = 0
     momentum = params['momentum']
     dropout_rate = params['dropout_rate']
     conv_filters = conv_filters_candidates[conv_filters_index]
@@ -250,40 +274,54 @@ def train_final_model(params):
     print(f"Selected momentum: {momentum}")
     print(f"Selected dropout_rate: {dropout_rate}")
 
-    train_dataset = torch.utils.data.TensorDataset(train_images, train_labels)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataset = torch.utils.data.TensorDataset(train_images, train_labels)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    # Final loader info (CNN)
+    final_train_loader_info = train_loader_info_full.copy()
+    final_train_loader_info['batch_size'] = batch_size
+    final_train_loader_info['num_batches'] = int(np.ceil(final_train_loader_info['num_samples'] / batch_size))
+    final_train_loader_info['shuffle'] = True
+    final_train_loader_info['use_one_hot'] = False
+    final_train_loader_info['model_type'] = 'cnn'
+    final_val_loader_info = final_train_loader_info
+
+    final_test_loader_info = test_loader_info.copy()
+    final_test_loader_info['batch_size'] = batch_size
+    final_test_loader_info['num_batches'] = int(np.ceil(final_test_loader_info['num_samples'] / batch_size))
+    final_test_loader_info['use_one_hot'] = False
+    final_test_loader_info['model_type'] = 'cnn'
 
     regularization_types = ['none', 'dropout', 'early_stopping']
     results = {}
+    final_model = None # Store the model trained without regularization for visualization
 
     for reg in regularization_types:
         print(f"\nRunning final model with {reg} regularization")
-        if reg == 'dropout':
-            model = BasicCNN(conv_filters, dropout_rate=dropout_rate).to(device)
-        else:
-            model = BasicCNN(conv_filters).to(device)
+        current_dropout_rate = dropout_rate if reg == 'dropout' else 0.0
+        model = BasicCNN_NumPy(conv_filters, dropout_rate=current_dropout_rate)
 
-        criterion = nn.CrossEntropyLoss()
-        optimizer_ = optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+        loss_fn_ce, loss_deriv_fn_ce = cross_entropy_loss, cross_entropy_loss_derivative
+        optimizer = SGD_Optimizer(model, learning_rate=lr, momentum=momentum)
 
-        train(model, train_loader, val_loader if reg == 'early_stopping' else None,
-              criterion, optimizer_, num_epochs, regularization=reg)
-
-        test_accuracy = test(model, test_loader)
+        train_numpy_ce(model, final_train_loader_info, final_val_loader_info if reg == 'early_stopping' else None,
+                       loss_fn_ce, loss_deriv_fn_ce, optimizer, num_epochs, regularization=reg, patience=5)
+        test_accuracy = test_numpy_ce(model, final_test_loader_info)
         results[reg] = test_accuracy
         print(f'Final Test Accuracy with {reg}: {test_accuracy:.2f}%')
-
-        # 在无正则化的模型上可视化卷积核（可根据需要调整）
+        
+        # Save the model trained without regularization for visualization
         if reg == 'none':
-            print("\nVisualizing convolution kernels of the first layer...")
-            visualize_conv_kernels(model)
+            final_model = model 
 
-    # 打印最终结果表
+    # Create and print results table
     df = pd.DataFrame(list(results.items()), columns=['Regularization', 'Test Accuracy (%)'])
-    print("\n=== Final Results Table ===")
+    print("\n=== Final Results Table (NumPy CNN) ===")
     print(df)
+    
+    # Visualize kernels of the final model (trained without regularization)
+    if final_model:
+        print("\nVisualizing kernels of the final model (no regularization)...")
+        visualize_conv_kernels(final_model)
+    else:
+        print("\n无法可视化卷积核，因为没有训练好的'none'正则化模型。")
 
-# 使用最佳参数训练最终模型
-train_final_model(best_params['params'])
+# Train the final model with best parameters using the NumPy CNN version
+train_final_model_numpy_cnn(best_params['params'])

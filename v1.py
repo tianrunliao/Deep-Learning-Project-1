@@ -1,121 +1,145 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import gzip
 import struct
+import os # 用于数据路径
 
-# 设置随机种子以确保结果可重复
-torch.manual_seed(321)
+# 从 NumPy 版本的 function.py 导入所需组件
+try:
+    from function import (
+        load_mnist_data, BasicMLP_NumPy,
+        mse_loss, mse_loss_derivative, # MSE 损失及其梯度
+        SGD_Optimizer, # NumPy SGD 优化器
+        get_batch, # 获取批次数据
+        one_hot_encode # NumPy one-hot 编码
+    )
+    print("成功从 function.py (NumPy 版) 导入模块。")
+except ImportError as e:
+    print(f"无法导入 function.py (NumPy 版): {e}")
+    print("请确保 function.py 存在且已更新为 NumPy 版本。")
+    exit()
 
-# 1. 自定义加载MNIST数据集
-def load_mnist_images(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_images, rows, cols = struct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num_images, rows, cols)
-    return images
+# 设置随机种子以确保结果可重复 (NumPy 版本)
+np.random.seed(321)
 
-def load_mnist_labels(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        magic, num_labels = struct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels
+# 1. 加载 MNIST 数据集 (使用 function.py 中的 NumPy 函数)
+#    不再需要自定义的 load_mnist_images/labels
 
-# 数据路径
-train_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-images-idx3-ubyte.gz'
-train_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/train-labels-idx1-ubyte.gz'
-test_images_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-images-idx3-ubyte.gz'
-test_labels_path = '/Users/tianrunliao/Desktop/廖天润 22300680285 project 1/dataset/MNIST/t10k-labels-idx1-ubyte.gz'
+# 数据路径 (尝试使其更通用)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+default_data_dir = os.path.join(script_dir, 'dataset', 'MNIST')
+# 如果默认路径不存在，尝试上级目录
+if not os.path.exists(default_data_dir):
+    default_data_dir = os.path.join(os.path.dirname(script_dir), 'dataset', 'MNIST')
 
-# 加载数据
-train_images = load_mnist_images(train_images_path)
-train_labels = load_mnist_labels(train_labels_path)
-test_images = load_mnist_images(test_images_path)
-test_labels = load_mnist_labels(test_labels_path)
+data_dir = default_data_dir # 可以修改为实际路径
+print(f"使用 MNIST 数据目录: {data_dir}")
 
-# 数据预处理：将图像归一化到[0, 1]并转换为PyTorch张量
-train_images = torch.tensor(train_images, dtype=torch.float32) / 255.0
-test_images = torch.tensor(test_images, dtype=torch.float32) / 255.0
-train_labels = torch.tensor(train_labels, dtype=torch.long)
-test_labels = torch.tensor(test_labels, dtype=torch.long)
+try:
+    train_images_path = os.path.join(data_dir, "train-images-idx3-ubyte.gz")
+    train_labels_path = os.path.join(data_dir, "train-labels-idx1-ubyte.gz")
+    train_images, train_labels = load_mnist_data(train_images_path, train_labels_path) # 已展平并归一化
 
-# 将图像展平为1D向量（28x28 -> 784）
-train_images = train_images.view(-1, 28 * 28)
-test_images = test_images.view(-1, 28 * 28)
+    test_images_path = os.path.join(data_dir, "t10k-images-idx3-ubyte.gz")
+    test_labels_path = os.path.join(data_dir, "t10k-labels-idx1-ubyte.gz")
+    test_images, test_labels = load_mnist_data(test_images_path, test_labels_path) # 已展平并归一化
+except FileNotFoundError:
+    print(f"错误：在 '{data_dir}' 中找不到 MNIST 数据文件。请检查路径。")
+    exit()
 
-# 将标签转换为one-hot编码（用于MSE损失）
-def to_one_hot(labels, num_classes=10):
-    return torch.eye(num_classes)[labels]
+# 数据预处理：标签转换为 one-hot 编码 (NumPy 版本)
+num_classes = 10
+train_labels_one_hot = one_hot_encode(train_labels, num_classes)
+test_labels_one_hot = one_hot_encode(test_labels, num_classes)
 
-train_labels_one_hot = to_one_hot(train_labels)
-test_labels_one_hot = to_one_hot(test_labels)
+# 创建数据加载器信息字典 (替代 DataLoader)
+batch_size = 64
+train_loader_info = {
+    'images': train_images,
+    'labels': train_labels_one_hot, # 使用 one-hot 标签
+    'batch_size': batch_size,
+    'num_samples': train_images.shape[0],
+    'num_batches': int(np.ceil(train_images.shape[0] / batch_size)),
+    'shuffle': True,
+    'use_one_hot': True, # 表明标签已是 one-hot
+    'num_classes': num_classes
+}
+test_loader_info = {
+    'images': test_images,
+    'labels': test_labels_one_hot, # 使用 one-hot 标签
+    'batch_size': batch_size,
+    'num_samples': test_images.shape[0],
+    'num_batches': int(np.ceil(test_images.shape[0] / batch_size)),
+    'shuffle': False,
+    'use_one_hot': True, # 表明标签已是 one-hot
+    'num_classes': num_classes
+}
 
-# 创建PyTorch数据集和数据加载器
-train_dataset = torch.utils.data.TensorDataset(train_images, train_labels_one_hot)
-test_dataset = torch.utils.data.TensorDataset(test_images, test_labels_one_hot)
+# 2. 定义和初始化模型 (使用导入的 NumPy MLP)
+#    固定结构 [128, 64]，激活函数 Sigmoid
+hidden_layers = [128, 64]
+activation = 'sigmoid'
+model = BasicMLP_NumPy(nHidden=hidden_layers, activation_fn=activation, dropout_rate=0.0)
 
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
+# 3. 初始化损失函数和优化器 (NumPy 版本)
+#    使用 MSE 损失
+loss_fn, loss_derivative_fn = mse_loss, mse_loss_derivative
+optimizer = SGD_Optimizer(model=model, learning_rate=0.1, momentum=0.0) # 调整学习率，无动量
 
-# 2. 定义一个完全未优化的MLP模型（固定隐藏层结构）
-class BasicMLP(nn.Module):
-    def __init__(self):
-        super(BasicMLP, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(28 * 28, 128),  # 输入层到第一个隐藏层，固定128个神经元
-            nn.Sigmoid(),             # 使用简单的Sigmoid激活函数
-            nn.Linear(128, 64),       # 第一个隐藏层到第二个隐藏层，固定64个神经元
-            nn.Sigmoid(),
-            nn.Linear(64, 10)         # 第二个隐藏层到输出层（10个类别）
-        )
-
-    def forward(self, x):
-        return self.layers(x)
-
-# 3. 初始化模型、损失函数和优化器
-model = BasicMLP()  # 固定结构，不通过nHidden指定
-criterion = nn.MSELoss()  # 使用均方误差损失（未使用交叉熵）
-optimizer = optim.SGD(model.parameters(), lr=0.01)  # 简单SGD，无动量
-
-# 4. 训练模型
-def train(model, train_loader, criterion, optimizer, num_epochs=5):
-    model.train()
+# 4. 训练模型 (NumPy 版本)
+def train_numpy(model, loader_info, loss_fn, loss_derivative_fn, optimizer, num_epochs=5):
+    model.set_training_mode(True) # 训练模式
     for epoch in range(num_epochs):
         running_loss = 0.0
-        for i, (images, labels) in enumerate(train_loader):
-            # 前向传播
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+        indices = np.arange(loader_info['num_samples'])
+        if loader_info['shuffle']:
+            np.random.shuffle(indices)
 
-            # 反向传播和优化
-            optimizer.zero_grad()
-            loss.backward()
+        for i in range(loader_info['num_batches']):
+            # 获取批次数据 (已经是 one-hot)
+            batch_images, batch_labels_one_hot = get_batch(loader_info, i, indices)
+
+            # 前向传播
+            logits = model.forward(batch_images) # 输出是 logits
+
+            # 计算损失 (MSE)
+            loss = loss_fn(logits, batch_labels_one_hot)
+
+            # 计算梯度 (MSE)
+            grad_loss = loss_derivative_fn(logits, batch_labels_one_hot)
+
+            # 反向传播
+            model.backward(grad_loss)
+
+            # 更新参数
             optimizer.step()
 
-            running_loss += loss.item()
+            running_loss += loss
             if (i + 1) % 100 == 0:
-                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {running_loss/100:.4f}')
+                print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{loader_info["num_batches"]}], Loss: {running_loss/100:.4f}')
                 running_loss = 0.0
+    model.set_training_mode(False) # 结束时设为评估模式
 
-# 5. 测试模型
-def test(model, test_loader):
-    model.eval()
+# 5. 测试模型 (NumPy 版本)
+def test_numpy(model, loader_info):
+    model.set_training_mode(False) # 评估模式
     correct = 0
     total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            _, true_labels = torch.max(labels, 1)  # 从one-hot转换回类别
-            total += true_labels.size(0)
-            correct += (predicted == true_labels).sum().item()
+    for i in range(loader_info['num_batches']):
+        images, labels_one_hot = get_batch(loader_info, i)
+
+        logits = model.forward(images)
+        predicted_indices = np.argmax(logits, axis=1)
+        true_indices = np.argmax(labels_one_hot, axis=1) # 从 one-hot 转回索引
+
+        total += true_indices.shape[0]
+        correct += np.sum(predicted_indices == true_indices)
 
     accuracy = 100 * correct / total
     print(f'Test Accuracy: {accuracy:.2f}%')
     return accuracy
 
 # 6. 运行训练和测试
-print("Training the model...")
-train(model, train_loader, criterion, optimizer, num_epochs=5)
-print("\nTesting the model...")
-test_accuracy = test(model, test_loader)
+print("Training the model (NumPy)...")
+train_numpy(model, train_loader_info, loss_fn, loss_derivative_fn, optimizer, num_epochs=5)
+print("Testing the model (NumPy)...")
+test_accuracy = test_numpy(model, test_loader_info)
